@@ -1,0 +1,29 @@
+{
+  "name": "polymarket-arbitrage-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-oriented Polymarket arbitrage bot built with Node.js and TypeScript.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "node dist/main.js",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "backtest": "tsx src/main.ts --mode=backtest",
+    "security:check": "node scripts/security-check.mjs"
+  },
+  "dependencies": {
+    "@polymarket/clob-client": "^5.8.1",
+    "dotenv": "^17.2.3",
+    "ethers": "^5.8.0",
+    "pino": "^9.12.0",
+    "ws": "^8.18.3",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
