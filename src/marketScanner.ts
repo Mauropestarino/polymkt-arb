@@ -3,7 +3,14 @@ import WebSocket from "ws";
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import type { MarketBookState, MarketDefinition, OrderBookLevel } from "./types.js";
-import { chunk, parseArrayField, round, safeJsonParse } from "./lib/utils.js";
+import {
+  chunk,
+  computeBackoffDelay,
+  parseArrayField,
+  round,
+  safeJsonParse,
+  sleep,
+} from "./lib/utils.js";
 import { OrderBookStore } from "./orderBookStore.js";
 import { EventJournal } from "./lib/journal.js";
 import { WalletService } from "./wallet.js";
@@ -13,7 +20,9 @@ type RawMarket = Record<string, unknown>;
 export class MarketScanner extends EventEmitter {
   private websocket?: WebSocket;
   private heartbeat?: NodeJS.Timeout;
+  private watchdog?: NodeJS.Timeout;
   private reconnectTimer?: NodeJS.Timeout;
+  private reseedPromise?: Promise<void>;
   private reconnects = 0;
   private stopped = false;
   private lastMessageAt?: number;
@@ -29,6 +38,7 @@ export class MarketScanner extends EventEmitter {
   }
 
   async start(): Promise<MarketDefinition[]> {
+    this.stopped = false;
     this.logger.info("Fetching active markets from Gamma API");
     const markets = await this.fetchActiveMarkets();
     this.store.registerMarkets(markets);
@@ -41,20 +51,17 @@ export class MarketScanner extends EventEmitter {
 
   async stop(): Promise<void> {
     this.stopped = true;
-
-    if (this.heartbeat) {
-      clearInterval(this.heartbeat);
-      this.heartbeat = undefined;
-    }
-
+    this.clearConnectionTimers();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
 
     if (this.websocket) {
-      this.websocket.close();
+      const websocket = this.websocket;
       this.websocket = undefined;
+      websocket.removeAllListeners();
+      websocket.close();
     }
   }
 
@@ -117,7 +124,7 @@ export class MarketScanner extends EventEmitter {
 
     this.logger.info(
       { discovered: deduped.length, selected: limited.length },
-      "Active markets fetched from CLOB",
+      "Active markets fetched from Gamma",
     );
 
     return limited;
@@ -239,13 +246,10 @@ export class MarketScanner extends EventEmitter {
       await Promise.all(
         batch.map(async (tokenId) => {
           try {
-            const book = (await this.wallet.publicClient.getOrderBook(tokenId)) as {
-              bids: Array<{ price: string; size: string }>;
-              asks: Array<{ price: string; size: string }>;
-              tick_size?: string;
-              min_order_size?: string;
-              neg_risk?: boolean;
-            };
+            const book = await this.seedOrderBookWithRetry(tokenId);
+            if (!book) {
+              return;
+            }
 
             const state = this.store.applySnapshot(
               tokenId,
@@ -270,6 +274,49 @@ export class MarketScanner extends EventEmitter {
     }
   }
 
+  private async seedOrderBookWithRetry(
+    tokenId: string,
+  ): Promise<
+    | {
+        bids: Array<{ price: string; size: string }>;
+        asks: Array<{ price: string; size: string }>;
+        tick_size?: string;
+        min_order_size?: string;
+        neg_risk?: boolean;
+      }
+    | undefined
+  > {
+    for (let attempt = 0; attempt <= 5; attempt += 1) {
+      try {
+        return (await this.wallet.publicClient.getOrderBook(tokenId)) as {
+          bids: Array<{ price: string; size: string }>;
+          asks: Array<{ price: string; size: string }>;
+          tick_size?: string;
+          min_order_size?: string;
+          neg_risk?: boolean;
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const isRateLimited = message.includes("429") || message.toLowerCase().includes("too many requests");
+
+        if (!isRateLimited || attempt === 5) {
+          this.logger.error({ error, tokenId, attempt }, "Skipping order book seed after retries");
+          return undefined;
+        }
+
+        const delayMs = computeBackoffDelay(
+          this.config.wsReconnectBaseMs,
+          this.config.wsReconnectMaxMs,
+          attempt,
+        );
+        this.logger.warn({ tokenId, attempt, delayMs }, "Rate limited while seeding order book, backing off");
+        await sleep(delayMs);
+      }
+    }
+
+    return undefined;
+  }
+
   private async connectWebSocket(): Promise<void> {
     if (this.stopped) {
       return;
@@ -277,69 +324,162 @@ export class MarketScanner extends EventEmitter {
 
     const websocket = new WebSocket(this.config.marketWsUrl);
     this.websocket = websocket;
+    const staleThresholdMs = this.getStaleThresholdMs();
 
-    websocket.on("open", () => {
-      this.logger.info("Connected to Polymarket market WebSocket");
-      this.subscribeToTrackedTokens();
-      this.heartbeat = setInterval(() => {
-        if (websocket.readyState === WebSocket.OPEN) {
-          websocket.send(JSON.stringify({}));
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const resolveOnce = () => {
+        if (settled) {
+          return;
         }
-      }, this.config.heartbeatIntervalMs);
-      this.heartbeat.unref();
-    });
 
-    websocket.on("message", (payload) => {
-      this.lastMessageAt = Date.now();
-      const parsed = safeJsonParse<unknown>(payload.toString());
-      const messages = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-      for (const message of messages) {
-        this.handleSocketMessage(message as Record<string, unknown>);
+        settled = true;
+        resolve();
+      };
+
+      const rejectOnce = (error: Error) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        reject(error);
+      };
+
+      websocket.on("open", () => {
+        if (this.stopped || this.websocket !== websocket) {
+          rejectOnce(new Error("Market WebSocket opened after scanner shutdown or replacement."));
+          return;
+        }
+
+        this.lastMessageAt = Date.now();
+        this.logger.info({ reconnects: this.reconnects }, "Connected to Polymarket market WebSocket");
+        this.subscribeToTrackedTokens(websocket);
+        this.startHeartbeat(websocket);
+        this.startWatchdog(websocket, staleThresholdMs);
+
+        if (this.reconnects > 0) {
+          this.refreshTrackedOrderBooks("websocket_reconnect");
+        }
+
+        resolveOnce();
+      });
+
+      websocket.on("message", (payload) => {
+        if (this.websocket !== websocket) {
+          return;
+        }
+
+        this.lastMessageAt = Date.now();
+        const parsed = safeJsonParse<unknown>(payload.toString());
+        const messages = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+        for (const message of messages) {
+          this.handleSocketMessage(message as Record<string, unknown>);
+        }
+      });
+
+      websocket.on("close", (code, reasonBuffer) => {
+        const isCurrentSocket = this.websocket === websocket;
+        const reason = reasonBuffer.toString("utf8");
+
+        if (isCurrentSocket) {
+          this.websocket = undefined;
+          this.clearConnectionTimers();
+        }
+
+        if (!settled) {
+          rejectOnce(
+            new Error(
+              `Market WebSocket closed before opening (code=${code}, reason=${reason || "none"}).`,
+            ),
+          );
+          return;
+        }
+
+        if (!this.stopped && isCurrentSocket) {
+          this.reconnects += 1;
+          this.logger.warn(
+            { reconnects: this.reconnects, code, reason: reason || undefined },
+            "Market WebSocket disconnected, scheduling reconnect",
+          );
+          this.journal.logError(new Error("Market WebSocket disconnected"), {
+            source: "market_scanner",
+            event: "websocket_close",
+            reconnects: this.reconnects,
+            code,
+            reason,
+          });
+          this.scheduleReconnect("close");
+        }
+      });
+
+      websocket.on("error", (error) => {
+        if (this.websocket !== websocket) {
+          return;
+        }
+
+        if (!settled) {
+          this.websocket = undefined;
+          this.clearConnectionTimers();
+          rejectOnce(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+
+        this.logger.warn({ error }, "Market WebSocket error, forcing reconnect");
+        this.journal.logError(error, {
+          source: "market_scanner",
+          event: "websocket_error",
+          reconnects: this.reconnects,
+        });
+        this.forceReconnect(websocket, "error");
+      });
+    }).catch((error) => {
+      if (this.websocket === websocket) {
+        this.websocket = undefined;
       }
-    });
-
-    websocket.on("close", () => {
-      if (this.heartbeat) {
-        clearInterval(this.heartbeat);
-        this.heartbeat = undefined;
-      }
-
-      if (!this.stopped) {
-        this.reconnects += 1;
-        this.logger.warn({ reconnects: this.reconnects }, "Market WebSocket disconnected, scheduling reconnect");
-        this.scheduleReconnect();
-      }
-    });
-
-    websocket.on("error", (error) => {
-      this.logger.warn({ error }, "Market WebSocket error");
+      this.clearConnectionTimers();
+      websocket.removeAllListeners();
+      websocket.terminate();
+      throw error;
     });
   }
 
-  private scheduleReconnect(): void {
+  private scheduleReconnect(trigger: "close" | "error" | "stale" | "retry"): void {
     if (this.reconnectTimer || this.stopped) {
       return;
     }
 
-    const delay = Math.min(
-      this.config.wsReconnectBaseMs * 2 ** Math.min(this.reconnects, 6),
+    const attempt = Math.max(0, this.reconnects - 1);
+    const delay = computeBackoffDelay(
+      this.config.wsReconnectBaseMs,
       this.config.wsReconnectMaxMs,
+      attempt,
     );
+    this.logger.info({ trigger, delayMs: delay, reconnects: this.reconnects }, "Scheduling market WebSocket reconnect");
 
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = undefined;
       try {
+        this.logger.info({ trigger, reconnects: this.reconnects }, "Reconnecting to Polymarket market WebSocket");
         await this.connectWebSocket();
       } catch (error) {
         this.logger.error({ error }, "Failed to reconnect market WebSocket");
-        this.scheduleReconnect();
+        this.journal.logError(error, {
+          source: "market_scanner",
+          event: "websocket_reconnect_failed",
+          reconnects: this.reconnects,
+          trigger,
+        });
+        this.reconnects += 1;
+        this.scheduleReconnect("retry");
       }
     }, delay);
     this.reconnectTimer.unref();
   }
 
-  private subscribeToTrackedTokens(): void {
-    if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
+  private subscribeToTrackedTokens(websocket = this.websocket): void {
+    if (!websocket || websocket.readyState !== WebSocket.OPEN) {
       return;
     }
 
@@ -348,7 +488,7 @@ export class MarketScanner extends EventEmitter {
     const [initialBatch, ...additionalBatches] = batches;
 
     if (initialBatch && initialBatch.length > 0) {
-      this.websocket.send(
+      websocket.send(
         JSON.stringify({
           type: "market",
           assets_ids: initialBatch,
@@ -358,7 +498,7 @@ export class MarketScanner extends EventEmitter {
     }
 
     for (const batch of additionalBatches) {
-      this.websocket.send(
+      websocket.send(
         JSON.stringify({
           operation: "subscribe",
           assets_ids: batch,
@@ -472,5 +612,112 @@ export class MarketScanner extends EventEmitter {
       price: Number(level.price),
       size: Number(level.size),
     }));
+  }
+
+  private clearConnectionTimers(): void {
+    if (this.heartbeat) {
+      clearInterval(this.heartbeat);
+      this.heartbeat = undefined;
+    }
+
+    if (this.watchdog) {
+      clearInterval(this.watchdog);
+      this.watchdog = undefined;
+    }
+  }
+
+  private startHeartbeat(websocket: WebSocket): void {
+    this.clearConnectionTimers();
+    this.heartbeat = setInterval(() => {
+      if (this.websocket !== websocket || websocket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      websocket.send(JSON.stringify({}));
+    }, this.config.heartbeatIntervalMs);
+    this.heartbeat.unref();
+  }
+
+  private startWatchdog(websocket: WebSocket, staleThresholdMs: number): void {
+    this.watchdog = setInterval(() => {
+      if (this.websocket !== websocket || this.stopped) {
+        return;
+      }
+
+      const lastMessageAt = this.lastMessageAt ?? 0;
+      const ageMs = Date.now() - lastMessageAt;
+      if (ageMs < staleThresholdMs) {
+        return;
+      }
+
+      this.logger.warn(
+        { ageMs, staleThresholdMs, reconnects: this.reconnects },
+        "Market WebSocket appears stale, forcing reconnect",
+      );
+      this.journal.logError(new Error("Market WebSocket stale"), {
+        source: "market_scanner",
+        event: "websocket_stale",
+        ageMs,
+        staleThresholdMs,
+        reconnects: this.reconnects,
+      });
+      this.forceReconnect(websocket, "stale");
+    }, this.config.heartbeatIntervalMs);
+    this.watchdog.unref();
+  }
+
+  private forceReconnect(websocket: WebSocket, trigger: "error" | "stale"): void {
+    if (this.websocket !== websocket || this.stopped) {
+      return;
+    }
+
+    this.websocket = undefined;
+    this.clearConnectionTimers();
+    this.reconnects += 1;
+
+    try {
+      websocket.removeAllListeners();
+      websocket.terminate();
+    } catch (error) {
+      this.logger.debug({ error }, "Ignoring WebSocket termination failure during forced reconnect");
+    }
+
+    this.scheduleReconnect(trigger);
+  }
+
+  private getStaleThresholdMs(): number {
+    return Math.max(
+      this.config.heartbeatIntervalMs * 3,
+      this.config.pollingIntervalMs * 20,
+      30_000,
+    );
+  }
+
+  private refreshTrackedOrderBooks(reason: string): void {
+    if (this.reseedPromise || this.stopped) {
+      return;
+    }
+
+    const markets = this.store.getAllMarkets();
+    if (markets.length === 0) {
+      return;
+    }
+
+    this.reseedPromise = (async () => {
+      this.logger.info({ reason, markets: markets.length }, "Refreshing tracked order books");
+      await this.seedOrderBooks(markets);
+    })()
+      .catch((error) => {
+        this.logger.error({ error, reason }, "Failed to refresh tracked order books");
+        this.journal.logError(error, {
+          source: "market_scanner",
+          event: "orderbook_refresh_failed",
+          reason,
+          markets: markets.length,
+        });
+      })
+      .finally(() => {
+        this.reseedPromise = undefined;
+      });
   }
 }

@@ -1,13 +1,29 @@
-import { AssetType, ClobClient, type ApiKeyCreds } from "@polymarket/clob-client";
+import {
+  AssetType,
+  ClobClient,
+  type ApiKeyCreds,
+  type ClobSigner,
+} from "@polymarket/clob-client";
 import { Wallet } from "ethers";
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
+import { resolvePrivateKey } from "./secrets.js";
 
 export interface CollateralStatus {
   balance: number;
   allowance: number;
   updatedAt: number;
 }
+
+const createClobSigner = (wallet: Wallet): ClobSigner => ({
+  _signTypedData: async (domain, types, value) =>
+    wallet.signTypedData(
+      domain as Record<string, unknown>,
+      types as Record<string, Array<{ name: string; type: string }>>,
+      value as Record<string, unknown>,
+    ),
+  getAddress: async () => wallet.getAddress(),
+});
 
 export class WalletService {
   readonly publicClient: ClobClient;
@@ -36,14 +52,17 @@ export class WalletService {
 
   static async create(config: BotConfig, logger: Logger): Promise<WalletService> {
     const publicClient = new ClobClient(config.clobApiUrl, config.chainId);
+    const privateKey = await resolvePrivateKey(config);
 
-    if (!config.privateKey) {
+    if (!privateKey) {
       return new WalletService(config, logger, publicClient);
     }
 
-    const signer = new Wallet(config.privateKey);
-    const funderAddress = config.funderAddress ?? signer.address;
-    const baseClient = new ClobClient(config.clobApiUrl, config.chainId, signer);
+    const signer = new Wallet(privateKey);
+    const clobSigner = createClobSigner(signer);
+    const signerAddress = await signer.getAddress();
+    const funderAddress = config.funderAddress ?? signerAddress;
+    const baseClient = new ClobClient(config.clobApiUrl, config.chainId, clobSigner);
 
     const apiCreds =
       config.polyApiKey && config.polyApiSecret && config.polyApiPassphrase
@@ -57,7 +76,7 @@ export class WalletService {
     const tradingClient = new ClobClient(
       config.clobApiUrl,
       config.chainId,
-      signer,
+      clobSigner,
       apiCreds,
       config.polySignatureType,
       funderAddress,
@@ -66,6 +85,7 @@ export class WalletService {
     logger.info(
       {
         signer: signer.address,
+        signerAddress,
         funderAddress,
         signatureType: config.polySignatureType,
         dryRun: config.dryRun,

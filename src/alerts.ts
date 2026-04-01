@@ -1,6 +1,10 @@
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
-import type { ExecutionResult, RiskAssessment } from "./types.js";
+import type {
+  ExecutionResult,
+  LateResolutionAssessment,
+  RiskAssessment,
+} from "./types.js";
 
 export class AlertService {
   constructor(
@@ -8,18 +12,27 @@ export class AlertService {
     private readonly logger: Logger,
   ) {}
 
-  async notifyOpportunity(assessment: RiskAssessment): Promise<void> {
+  async notifyOpportunity(assessment: RiskAssessment | LateResolutionAssessment): Promise<void> {
     if (!assessment.viable) {
       return;
     }
 
-    const message = [
-      "Polymarket arb opportunity",
-      assessment.market.question,
-      `Arb: ${assessment.arb.toFixed(4)}`,
-      `Size: ${assessment.tradeSize.toFixed(4)}`,
-      `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
-    ].join("\n");
+    const message = this.isLateResolutionAssessment(assessment)
+      ? [
+          "Polymarket late-resolution opportunity",
+          assessment.market.question,
+          `Resolved side: ${assessment.resolvedOutcome}`,
+          `Ask: ${assessment.leg.bestAsk.toFixed(4)}`,
+          `Size: ${assessment.tradeSize.toFixed(4)}`,
+          `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
+        ].join("\n")
+      : [
+          "Polymarket arb opportunity",
+          assessment.market.question,
+          `Arb: ${assessment.arb.toFixed(4)}`,
+          `Size: ${assessment.tradeSize.toFixed(4)}`,
+          `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
+        ].join("\n");
 
     await Promise.allSettled([this.sendWebhook({ type: "opportunity", assessment }), this.sendTelegram(message)]);
   }
@@ -28,12 +41,16 @@ export class AlertService {
     const message = [
       `Polymarket trade ${result.success ? "executed" : "failed"}`,
       result.market.question,
+      `Strategy: ${result.strategyType}`,
+      result.resolvedOutcome ? `Resolved side: ${result.resolvedOutcome}` : undefined,
       `Mode: ${result.mode}`,
       `Size: ${result.tradeSize.toFixed(4)}`,
       `Expected profit: $${result.expectedProfitUsd.toFixed(4)}`,
       `Orders: ${result.orderIds.join(", ") || "n/a"}`,
       `Notes: ${result.notes.join(" | ") || "none"}`,
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
 
     await Promise.allSettled([this.sendWebhook({ type: "trade", result }), this.sendTelegram(message)]);
   }
@@ -85,5 +102,11 @@ export class AlertService {
     } catch (error) {
       this.logger.warn({ error }, "Telegram delivery errored");
     }
+  }
+
+  private isLateResolutionAssessment(
+    assessment: RiskAssessment | LateResolutionAssessment,
+  ): assessment is LateResolutionAssessment {
+    return "strategyType" in assessment && assessment.strategyType === "late_resolution";
   }
 }

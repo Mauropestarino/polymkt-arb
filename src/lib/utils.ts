@@ -31,6 +31,22 @@ export const sleep = (ms: number): Promise<void> => {
   });
 };
 
+export const jitter = (value: number, ratio = 0.2): number => {
+  const spread = value * ratio;
+  const offset = (Math.random() * spread * 2) - spread;
+  return Math.max(0, value + offset);
+};
+
+export const computeBackoffDelay = (
+  baseMs: number,
+  maxMs: number,
+  attempt: number,
+  ratio = 0.2,
+): number => {
+  const raw = Math.min(baseMs * 2 ** attempt, maxMs);
+  return Math.round(jitter(raw, ratio));
+};
+
 export const parseArrayField = (value: string | string[]): string[] => {
   if (Array.isArray(value)) {
     return value;
@@ -89,6 +105,18 @@ export const formatPct = (value: number): string => {
   return `${(value * 100).toFixed(3)}%`;
 };
 
+export const formatMs = (value?: number): string => {
+  if (value === undefined || Number.isNaN(value)) {
+    return "n/a";
+  }
+
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(2)}s`;
+  }
+
+  return `${value.toFixed(0)}ms`;
+};
+
 export const ensureDir = async (directory: string): Promise<void> => {
   await mkdir(directory, { recursive: true });
 };
@@ -123,4 +151,8 @@ export const toTickSize = (value?: number): TickSize => {
   }
 
   return "0.01";
+};
+
+export const isoDateStamp = (value = new Date()): string => {
+  return value.toISOString().slice(0, 10);
 };

@@ -3,16 +3,20 @@ import type { BotConfig } from "./config.js";
 import type {
   FeeEstimate,
   FillEstimate,
+  LateResolutionAssessment,
   MarketBookState,
   MarketDefinition,
+  ResolutionOutcome,
   RiskAssessment,
 } from "./types.js";
+import { calculateNetProfitModel, deriveOpportunityDirection } from "./lib/arbitrageMath.js";
 import { round, sum } from "./lib/utils.js";
 import { WalletService } from "./wallet.js";
 
 export class RiskManager {
   private readonly feeRateCache = new Map<string, { value: number; updatedAt: number }>();
   private readonly reservations = new Map<string, number>();
+  private readonly cooldownByOpportunityKey = new Map<string, number>();
 
   constructor(
     private readonly config: BotConfig,
@@ -37,12 +41,25 @@ export class RiskManager {
     this.reservations.delete(reservationId);
   }
 
+  canTriggerOpportunity(opportunityKey: string, now = Date.now()): boolean {
+    const lastTriggeredAt = this.cooldownByOpportunityKey.get(opportunityKey) ?? 0;
+    return now - lastTriggeredAt >= this.config.opportunityCooldownMs;
+  }
+
+  markOpportunityTriggered(opportunityKey: string, now = Date.now()): void {
+    this.cooldownByOpportunityKey.set(opportunityKey, now);
+  }
+
   async evaluate(state: MarketBookState, options?: { skipBalanceChecks?: boolean }): Promise<RiskAssessment> {
     const now = Date.now();
     const bestYesAsk = state.yes.bestAsk ?? state.yes.asks[0]?.price;
     const bestNoAsk = state.no.bestAsk ?? state.no.asks[0]?.price;
+    const direction =
+      bestYesAsk !== undefined && bestNoAsk !== undefined
+        ? deriveOpportunityDirection(bestYesAsk, bestNoAsk)
+        : "YES_high";
 
-    const baseFailure = this.buildFailure(state.market, now, "Missing best ask on one or both legs.");
+    const baseFailure = this.buildFailure(state.market, now, direction, "Missing best ask on one or both legs.");
     if (bestYesAsk === undefined || bestNoAsk === undefined) {
       return baseFailure;
     }
@@ -52,6 +69,7 @@ export class RiskManager {
       return this.buildFailure(
         state.market,
         now,
+        direction,
         `Raw arb ${roughArb.toFixed(5)} does not clear buffer ${this.config.arbitrageBuffer.toFixed(5)}.`,
       );
     }
@@ -60,6 +78,7 @@ export class RiskManager {
       return this.buildFailure(
         state.market,
         now,
+        direction,
         `Insufficient ask depth. yesLevels=${state.yes.asks.length}, noLevels=${state.no.asks.length}`,
       );
     }
@@ -72,7 +91,7 @@ export class RiskManager {
     );
 
     if (allowedYesAsks.length === 0 || allowedNoAsks.length === 0) {
-      return this.buildFailure(state.market, now, "No executable ask depth inside slippage tolerance.");
+      return this.buildFailure(state.market, now, direction, "No executable ask depth inside slippage tolerance.");
     }
 
     const candidateSizes = this.buildCandidateSizes(
@@ -86,7 +105,7 @@ export class RiskManager {
     );
 
     if (candidateSizes.length === 0) {
-      return this.buildFailure(state.market, now, "No candidate size found within configured trade size.");
+      return this.buildFailure(state.market, now, direction, "No candidate size found within configured trade size.");
     }
 
     const [yesFeeRateBps, noFeeRateBps] = await Promise.all([
@@ -95,7 +114,7 @@ export class RiskManager {
     ]);
 
     if (!this.config.allowFeeMarkets && (yesFeeRateBps > 0 || noFeeRateBps > 0)) {
-      return this.buildFailure(state.market, now, "Fee-enabled market skipped by configuration.");
+      return this.buildFailure(state.market, now, direction, "Fee-enabled market skipped by configuration.");
     }
 
     let bestAssessment: RiskAssessment | undefined;
@@ -110,13 +129,18 @@ export class RiskManager {
 
       const yesFee = this.estimateFee(state.market, yesFill, yesFeeRateBps);
       const noFee = this.estimateFee(state.market, noFill, noFeeRateBps);
-      const guaranteedPayoutUsd = Math.min(
-        candidateSize - yesFee.feeShares,
-        candidateSize - noFee.feeShares,
-      );
       const totalSpendUsd = yesFill.totalCost + noFill.totalCost;
-      const expectedProfitUsd = guaranteedPayoutUsd - totalSpendUsd - this.config.gasCostUsd;
-      const expectedProfitPct = totalSpendUsd > 0 ? expectedProfitUsd / totalSpendUsd : 0;
+      const profitModel = calculateNetProfitModel({
+        tradeSize: candidateSize,
+        totalSpendUsd,
+        feeLeg1Usd: yesFee.feeUsd,
+        feeLeg2Usd: noFee.feeUsd,
+        gasCostUsd: this.config.gasCostUsd,
+        slippageTolerance: this.config.slippageTolerance,
+      });
+      const guaranteedPayoutUsd = candidateSize;
+      const expectedProfitUsd = profitModel.netProfitUsd;
+      const expectedProfitPct = profitModel.netProfitPct;
 
       if (expectedProfitUsd <= 0 || expectedProfitPct < this.config.minProfitThreshold) {
         continue;
@@ -126,6 +150,7 @@ export class RiskManager {
         viable: true,
         market: state.market,
         timestamp: now,
+        direction,
         tradeSize: round(candidateSize, 6),
         yes: {
           ...yesFill,
@@ -139,6 +164,9 @@ export class RiskManager {
         },
         arb: roughArb,
         guaranteedPayoutUsd: round(guaranteedPayoutUsd, 6),
+        grossEdgeUsd: profitModel.grossEdgeUsd,
+        totalFeesUsd: profitModel.totalFeesUsd,
+        estimatedSlippageUsd: profitModel.estimatedSlippageUsd,
         totalSpendUsd: round(totalSpendUsd, 6),
         gasUsd: this.config.gasCostUsd,
         expectedProfitUsd: round(expectedProfitUsd, 6),
@@ -154,6 +182,7 @@ export class RiskManager {
           return this.buildFailure(
             state.market,
             now,
+            direction,
             `Insufficient balance. need=${totalSpendUsd.toFixed(4)} balance=${collateral.balance.toFixed(4)}`,
           );
         }
@@ -162,6 +191,7 @@ export class RiskManager {
           return this.buildFailure(
             state.market,
             now,
+            direction,
             `Insufficient allowance. need=${totalSpendUsd.toFixed(4)} allowance=${collateral.allowance.toFixed(4)}`,
           );
         }
@@ -170,6 +200,7 @@ export class RiskManager {
           return this.buildFailure(
             state.market,
             now,
+            direction,
             `Open notional cap reached. available=${availableBuffer.toFixed(4)} need=${totalSpendUsd.toFixed(4)}`,
           );
         }
@@ -185,7 +216,150 @@ export class RiskManager {
       this.buildFailure(
         state.market,
         now,
+        direction,
         "No candidate size cleared min profit after slippage, fees, and gas.",
+      )
+    );
+  }
+
+  async evaluateLateResolution(
+    state: MarketBookState,
+    resolvedOutcome: ResolutionOutcome,
+    source: string,
+    options?: { skipBalanceChecks?: boolean },
+  ): Promise<LateResolutionAssessment> {
+    const now = Date.now();
+    const targetBook = resolvedOutcome === "YES" ? state.yes : state.no;
+    const bestAsk = targetBook.bestAsk ?? targetBook.asks[0]?.price;
+
+    if (bestAsk === undefined) {
+      return this.buildLateResolutionFailure(
+        state.market,
+        now,
+        resolvedOutcome,
+        source,
+        "Missing best ask on resolved winning side.",
+      );
+    }
+
+    const allowedAsks = targetBook.asks.filter(
+      (level) => level.price <= bestAsk * (1 + this.config.slippageTolerance),
+    );
+
+    if (allowedAsks.length === 0) {
+      return this.buildLateResolutionFailure(
+        state.market,
+        now,
+        resolvedOutcome,
+        source,
+        "No executable ask depth inside slippage tolerance for late resolution.",
+      );
+    }
+
+    const candidateSizes = this.buildCandidateSizes(
+      allowedAsks,
+      allowedAsks,
+      Math.min(this.config.maxTradeSize, this.cumulativeSize(allowedAsks)),
+    );
+
+    const feeRateBps = await this.getFeeRateBps(state.market, targetBook.tokenId);
+    let bestAssessment: LateResolutionAssessment | undefined;
+
+    for (const candidateSize of candidateSizes.toSorted((left, right) => right - left)) {
+      const fill = this.estimateBuyFill(allowedAsks, candidateSize);
+      if (fill.executableSize < candidateSize) {
+        continue;
+      }
+
+      const fee = this.estimateFee(state.market, fill, feeRateBps);
+      const totalSpendUsd = fill.totalCost;
+      const profitModel = calculateNetProfitModel({
+        tradeSize: candidateSize,
+        totalSpendUsd,
+        feeLeg1Usd: fee.feeUsd,
+        feeLeg2Usd: 0,
+        gasCostUsd: this.config.gasCostUsd,
+        slippageTolerance: this.config.slippageTolerance,
+      });
+
+      if (
+        profitModel.netProfitUsd <= 0 ||
+        profitModel.netProfitPct < this.config.minProfitThreshold
+      ) {
+        continue;
+      }
+
+      if (!options?.skipBalanceChecks) {
+        const collateral = await this.wallet.getCollateralStatus();
+        const availableBuffer = this.config.maxOpenNotional - this.getOpenNotionalUsd();
+
+        if (collateral.balance < totalSpendUsd) {
+          return this.buildLateResolutionFailure(
+            state.market,
+            now,
+            resolvedOutcome,
+            source,
+            `Insufficient balance. need=${totalSpendUsd.toFixed(4)} balance=${collateral.balance.toFixed(4)}`,
+          );
+        }
+
+        if (collateral.allowance < totalSpendUsd) {
+          return this.buildLateResolutionFailure(
+            state.market,
+            now,
+            resolvedOutcome,
+            source,
+            `Insufficient allowance. need=${totalSpendUsd.toFixed(4)} allowance=${collateral.allowance.toFixed(4)}`,
+          );
+        }
+
+        if (availableBuffer < totalSpendUsd) {
+          return this.buildLateResolutionFailure(
+            state.market,
+            now,
+            resolvedOutcome,
+            source,
+            `Open notional cap reached. available=${availableBuffer.toFixed(4)} need=${totalSpendUsd.toFixed(4)}`,
+          );
+        }
+      }
+
+      const assessment: LateResolutionAssessment = {
+        viable: true,
+        strategyType: "late_resolution",
+        market: state.market,
+        timestamp: now,
+        resolvedOutcome,
+        tradeSize: round(candidateSize, 6),
+        leg: {
+          ...fill,
+          tokenId: targetBook.tokenId,
+          bestAsk,
+          fee,
+        },
+        grossEdgeUsd: profitModel.grossEdgeUsd,
+        totalFeesUsd: profitModel.totalFeesUsd,
+        estimatedSlippageUsd: profitModel.estimatedSlippageUsd,
+        totalSpendUsd: round(totalSpendUsd, 6),
+        gasUsd: this.config.gasCostUsd,
+        expectedProfitUsd: round(profitModel.netProfitUsd, 6),
+        expectedProfitPct: round(profitModel.netProfitPct, 6),
+        source,
+      };
+
+      if (!bestAssessment || assessment.expectedProfitUsd > bestAssessment.expectedProfitUsd) {
+        bestAssessment = assessment;
+      }
+    }
+
+    return (
+      bestAssessment ??
+      this.buildLateResolutionFailure(
+        state.market,
+        now,
+        resolvedOutcome,
+        source,
+        "No candidate size cleared min profit for late-resolution edge.",
       )
     );
   }
@@ -258,10 +432,7 @@ export class RiskManager {
     const feeRate = feeRateBps / 10_000;
     const feeExponent = this.getFeeExponent(market);
     const p = fill.averagePrice;
-    const feeUsd =
-      fill.executableSize > 0 && feeRate > 0
-        ? fill.executableSize * p * feeRate * (p * (1 - p)) ** feeExponent
-        : 0;
+    const feeUsd = fill.totalCost * feeRate;
     const feeShares = p > 0 ? feeUsd / p : 0;
 
     return {
@@ -297,12 +468,18 @@ export class RiskManager {
     return value;
   }
 
-  private buildFailure(market: MarketDefinition, timestamp: number, reason: string): RiskAssessment {
+  private buildFailure(
+    market: MarketDefinition,
+    timestamp: number,
+    direction: RiskAssessment["direction"],
+    reason: string,
+  ): RiskAssessment {
     return {
       viable: false,
       reason,
       market,
       timestamp,
+      direction,
       tradeSize: 0,
       yes: {
         requestedSize: 0,
@@ -340,11 +517,58 @@ export class RiskManager {
       },
       arb: 0,
       guaranteedPayoutUsd: 0,
+      grossEdgeUsd: 0,
+      totalFeesUsd: 0,
+      estimatedSlippageUsd: 0,
       totalSpendUsd: 0,
       gasUsd: this.config.gasCostUsd,
       expectedProfitUsd: 0,
       expectedProfitPct: 0,
       netEdgePerShare: 0,
+    };
+  }
+
+  private buildLateResolutionFailure(
+    market: MarketDefinition,
+    timestamp: number,
+    resolvedOutcome: ResolutionOutcome,
+    source: string,
+    reason: string,
+  ): LateResolutionAssessment {
+    return {
+      viable: false,
+      reason,
+      strategyType: "late_resolution",
+      market,
+      timestamp,
+      resolvedOutcome,
+      tradeSize: 0,
+      leg: {
+        tokenId: resolvedOutcome === "YES" ? market.yesTokenId : market.noTokenId,
+        requestedSize: 0,
+        executableSize: 0,
+        totalCost: 0,
+        averagePrice: 0,
+        worstPrice: 0,
+        slippagePct: 0,
+        levelsConsumed: 0,
+        bestAsk: 0,
+        fee: {
+          feeRateBps: 0,
+          feeRate: 0,
+          feeExponent: 1,
+          feeUsd: 0,
+          feeShares: 0,
+        },
+      },
+      grossEdgeUsd: 0,
+      totalFeesUsd: 0,
+      estimatedSlippageUsd: 0,
+      totalSpendUsd: 0,
+      gasUsd: this.config.gasCostUsd,
+      expectedProfitUsd: 0,
+      expectedProfitPct: 0,
+      source,
     };
   }
 }

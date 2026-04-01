@@ -3,6 +3,8 @@ dist
 .env
 .env.*
 !.env.example
+.pm2
+data
 data/*.log
 data/*.ndjson
 data/*.json

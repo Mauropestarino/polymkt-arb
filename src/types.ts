@@ -3,6 +3,10 @@ export interface OrderBookLevel {
   size: number;
 }
 
+export type ArbitrageDirection = "YES_high" | "NO_high";
+export type StrategyType = "binary_arb" | "late_resolution";
+export type ResolutionOutcome = "YES" | "NO";
+
 export interface GammaMarket {
   id: string;
   question: string;
@@ -93,6 +97,7 @@ export interface RiskAssessment {
   reason?: string;
   market: MarketDefinition;
   timestamp: number;
+  direction: ArbitrageDirection;
   tradeSize: number;
   yes: FillEstimate & {
     bestAsk: number;
@@ -104,6 +109,9 @@ export interface RiskAssessment {
   };
   arb: number;
   guaranteedPayoutUsd: number;
+  grossEdgeUsd: number;
+  totalFeesUsd: number;
+  estimatedSlippageUsd: number;
   totalSpendUsd: number;
   gasUsd: number;
   expectedProfitUsd: number;
@@ -119,16 +127,23 @@ export interface OrderStatusSnapshot {
   remainingSize: number;
   side: "BUY" | "SELL";
   tokenId: string;
+  averageFillPrice?: number;
+  realizedSlippageUsd?: number;
+  associateTradeIds?: string[];
 }
 
 export interface ExecutionResult {
   mode: "live" | "paper" | "backtest";
   success: boolean;
+  strategyType: StrategyType;
   market: MarketDefinition;
   timestamp: number;
   tradeSize: number;
+  resolvedOutcome?: ResolutionOutcome;
   expectedProfitUsd: number;
   realizedProfitUsd?: number;
+  estimatedSlippageUsd?: number;
+  realizedSlippageUsd?: number;
   orderIds: string[];
   notes: string[];
   hedged: boolean;
@@ -141,11 +156,20 @@ export interface OpportunityLogRecord {
   marketId: string;
   slug: string;
   question: string;
+  strategyType?: StrategyType;
+  resolvedOutcome?: ResolutionOutcome;
+  direction?: ArbitrageDirection;
   arb: number;
   tradeSize: number;
+  grossEdgeUsd?: number;
+  totalFeesUsd?: number;
+  estimatedSlippageUsd?: number;
   expectedProfitUsd: number;
   expectedProfitPct: number;
   viable: boolean;
+  detectedAt?: number;
+  expiredAt?: number;
+  opportunity_duration_ms?: number;
   reason?: string;
 }
 
@@ -157,9 +181,13 @@ export interface TradeLogRecord {
   marketId: string;
   slug: string;
   question: string;
+  strategyType?: StrategyType;
+  resolvedOutcome?: ResolutionOutcome;
   tradeSize: number;
   expectedProfitUsd: number;
   realizedProfitUsd?: number;
+  estimatedSlippageUsd?: number;
+  realizedSlippageUsd?: number;
   orderIds: string[];
   hedgeOrderIds: string[];
   notes: string[];
@@ -185,6 +213,21 @@ export interface ArbitrageEngineStats {
   opportunitiesSeen: number;
   opportunitiesViable: number;
   opportunitiesExecuted: number;
+  opportunitiesCaptured: number;
+  averageOpportunityDurationMs?: number;
+  completedOpportunityCount: number;
+  totalOpportunityDurationMs: number;
+  lastOpportunityAt?: number;
+}
+
+export interface LateResolutionStats {
+  opportunitiesSeen: number;
+  opportunitiesViable: number;
+  opportunitiesExecuted: number;
+  opportunitiesCaptured: number;
+  averageOpportunityDurationMs?: number;
+  completedOpportunityCount: number;
+  totalOpportunityDurationMs: number;
   lastOpportunityAt?: number;
 }
 
@@ -194,12 +237,89 @@ export interface ExecutionStats {
   executionsFailed: number;
   hedgesTriggered: number;
   openNotionalUsd: number;
+  filledShares: number;
+  intendedShares: number;
+  fillRate: number;
+  shareFillRate: number;
+  estimatedSlippageUsdTotal: number;
+  estimatedSlippageUsdAverage: number;
+  realizedSlippageUsdTotal: number;
+  realizedSlippageUsdAverage: number;
+}
+
+export interface RuntimeState {
+  startedAt: number;
+  dryRun: boolean;
+  getMarketsTracked(): number;
+  getOpenNotionalUsd(): number;
+  getOpportunitiesDetected(): number;
+  getViableOpportunities(): number;
+  getTradesExecuted(): number;
+  getTradesAttempted(): number;
+  getFillRate(): number;
+  getShareFillRate(): number;
+  getOpportunityCaptureRate(): number;
+  getAverageOpportunityDurationMs(): number;
+  getEstimatedSlippageUsdTotal(): number;
+  getRealizedSlippageUsdTotal(): number;
+  getErrorsTotal(): number;
+}
+
+export interface NetProfitModelInput {
+  tradeSize: number;
+  totalSpendUsd: number;
+  feeLeg1Usd: number;
+  feeLeg2Usd: number;
+  gasCostUsd: number;
+  slippageTolerance: number;
+}
+
+export interface NetProfitModelOutput {
+  grossEdgeUsd: number;
+  totalFeesUsd: number;
+  estimatedSlippageUsd: number;
+  netProfitUsd: number;
+  netProfitPct: number;
 }
 
 export interface DashboardSnapshot {
   startedAt: number;
   scanner: MarketScannerStats;
   arbitrage: ArbitrageEngineStats;
+  lateResolution?: LateResolutionStats;
   execution: ExecutionStats;
   recentOpportunities: OpportunityLogRecord[];
+}
+
+export interface LateResolutionSignal {
+  conditionId?: string;
+  marketId?: string;
+  slug?: string;
+  resolvedOutcome: ResolutionOutcome;
+  source: string;
+  resolvedAt: number;
+  note?: string;
+}
+
+export interface LateResolutionAssessment {
+  viable: boolean;
+  reason?: string;
+  strategyType: "late_resolution";
+  market: MarketDefinition;
+  timestamp: number;
+  resolvedOutcome: ResolutionOutcome;
+  tradeSize: number;
+  leg: FillEstimate & {
+    tokenId: string;
+    bestAsk: number;
+    fee: FeeEstimate;
+  };
+  grossEdgeUsd: number;
+  totalFeesUsd: number;
+  estimatedSlippageUsd: number;
+  totalSpendUsd: number;
+  gasUsd: number;
+  expectedProfitUsd: number;
+  expectedProfitPct: number;
+  source: string;
 }

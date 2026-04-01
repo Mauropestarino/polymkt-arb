@@ -106,6 +106,14 @@ const schema = z
     enableOrderbookPersistence: booleanish,
     backtestFile: z.string(),
     backtestMaxLines: nonNegativeInt(),
+    healthPort: positiveInt(),
+    logMaxFileSizeMb: positiveInt(),
+    logMaxRotatedFiles: positiveInt(),
+    enableLateResolutionStrategy: booleanish,
+    lateResolutionSignalFile: z.string(),
+    lateResolutionMaxSignalAgeMs: positiveInt(),
+    useGcpSecretManager: booleanish,
+    gcpPrivateKeySecretName: stringish,
     privateKey: stringish,
     polySignatureType: z.enum(["0", "1", "2"]).transform(Number),
     funderAddress: stringish,
@@ -131,12 +139,19 @@ const schema = z
     }
 
     if ((value.botMode === "live" && !value.dryRun) || value.polySignatureType !== 0) {
-      if (!value.privateKey) {
+      if (!value.privateKey && !value.useGcpSecretManager) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: "PRIVATE_KEY is required for live execution or non-EOA Polymarket accounts.",
         });
       }
+    }
+
+    if (value.useGcpSecretManager && !value.gcpPrivateKeySecretName) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "GCP_PRIVATE_KEY_SECRET_NAME is required when USE_GCP_SECRET_MANAGER=true.",
+      });
     }
 
     if (value.polySignatureType !== 0 && !value.funderAddress) {
@@ -169,12 +184,12 @@ const parsed = schema.parse({
   bookSeedConcurrency: envOrArg("BOOK_SEED_CONCURRENCY", "20"),
   feeCacheTtlMs: envOrArg("FEE_CACHE_TTL_MS", "300000"),
   balanceCacheTtlMs: envOrArg("BALANCE_CACHE_TTL_MS", "5000"),
-  minProfitThreshold: envOrArg("MIN_PROFIT_THRESHOLD", "0.01"),
+  minProfitThreshold: envOrArg("MIN_PROFIT_THRESHOLD", "0.005"),
   arbitrageBuffer: envOrArg("ARBITRAGE_BUFFER", "0.002"),
-  maxTradeSize: envOrArg("MAX_TRADE_SIZE", "100"),
-  maxOpenNotional: envOrArg("MAX_OPEN_NOTIONAL", "1000"),
-  slippageTolerance: envOrArg("SLIPPAGE_TOLERANCE", "0.02"),
-  hedgeSlippageTolerance: envOrArg("HEDGE_SLIPPAGE_TOLERANCE", "0.03"),
+  maxTradeSize: envOrArg("MAX_TRADE_SIZE", "50"),
+  maxOpenNotional: envOrArg("MAX_OPEN_NOTIONAL", "200"),
+  slippageTolerance: envOrArg("SLIPPAGE_TOLERANCE", "0.01"),
+  hedgeSlippageTolerance: envOrArg("HEDGE_SLIPPAGE_TOLERANCE", "0.02"),
   minOrderbookLevels: envOrArg("MIN_ORDERBOOK_LEVELS", "1"),
   executionOrderType: envOrArg("EXECUTION_ORDER_TYPE", "FOK")?.toUpperCase(),
   executionTimeoutMs: envOrArg("EXECUTION_TIMEOUT_MS", "1500"),
@@ -184,6 +199,14 @@ const parsed = schema.parse({
   enableOrderbookPersistence: envOrArg("ENABLE_ORDERBOOK_PERSISTENCE", "false"),
   backtestFile: envOrArg("BACKTEST_FILE", "./data/orderbooks.ndjson"),
   backtestMaxLines: envOrArg("BACKTEST_MAX_LINES", "0"),
+  healthPort: envOrArg("HEALTH_PORT", "3001"),
+  logMaxFileSizeMb: envOrArg("LOG_MAX_FILE_SIZE_MB", "50"),
+  logMaxRotatedFiles: envOrArg("LOG_MAX_ROTATED_FILES", "7"),
+  enableLateResolutionStrategy: envOrArg("ENABLE_LATE_RESOLUTION_STRATEGY", "true"),
+  lateResolutionSignalFile: envOrArg("LATE_RESOLUTION_SIGNAL_FILE", "./data/resolution-signals.ndjson"),
+  lateResolutionMaxSignalAgeMs: envOrArg("LATE_RESOLUTION_MAX_SIGNAL_AGE_MS", "900000"),
+  useGcpSecretManager: envOrArg("USE_GCP_SECRET_MANAGER", "false"),
+  gcpPrivateKeySecretName: envOrArg("GCP_PRIVATE_KEY_SECRET_NAME"),
   privateKey: envOrArg("PRIVATE_KEY"),
   polySignatureType: envOrArg("POLY_SIGNATURE_TYPE", "0"),
   funderAddress: envOrArg("FUNDER_ADDRESS"),
@@ -200,6 +223,7 @@ export const config = {
   ...parsed,
   logDir: path.resolve(parsed.cwd, parsed.logDir),
   backtestFile: path.resolve(parsed.cwd, parsed.backtestFile),
+  lateResolutionSignalFile: path.resolve(parsed.cwd, parsed.lateResolutionSignalFile),
 } as const;
 
 export type BotConfig = typeof config;

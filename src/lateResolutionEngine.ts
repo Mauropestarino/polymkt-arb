@@ -2,31 +2,32 @@ import { EventEmitter } from "node:events";
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import type {
-  ArbitrageDirection,
-  ArbitrageEngineStats,
+  LateResolutionAssessment,
+  LateResolutionSignal,
+  LateResolutionStats,
   MarketBookState,
   OpportunityLogRecord,
-  RiskAssessment,
 } from "./types.js";
 import { AlertService } from "./alerts.js";
 import { ExecutionEngine } from "./executionEngine.js";
 import { EventJournal } from "./lib/journal.js";
-import { deriveOpportunityDirection } from "./lib/arbitrageMath.js";
+import { ResolutionSignalStore } from "./resolutionSignalStore.js";
 import { RiskManager } from "./riskManager.js";
 
-interface ActiveOpportunityWindow {
+interface ActiveLateResolutionWindow {
   detectedAt: number;
-  direction: ArbitrageDirection;
+  signal: LateResolutionSignal;
   lastRecord: OpportunityLogRecord;
-  lastAssessment: RiskAssessment;
+  lastAssessment: LateResolutionAssessment;
   countedViable: boolean;
   attemptedExecution: boolean;
 }
 
-export class ArbitrageEngine extends EventEmitter {
+export class LateResolutionEngine extends EventEmitter {
   private readonly evaluationScheduled = new Set<string>();
   private readonly pendingStates = new Map<string, MarketBookState>();
-  private readonly activeOpportunityWindows = new Map<string, ActiveOpportunityWindow>();
+  private readonly activeOpportunityWindows = new Map<string, ActiveLateResolutionWindow>();
+  private readonly consumedSignalExecutions = new Map<string, number>();
   private opportunitiesSeen = 0;
   private opportunitiesViable = 0;
   private opportunitiesExecuted = 0;
@@ -37,6 +38,7 @@ export class ArbitrageEngine extends EventEmitter {
 
   constructor(
     private readonly config: BotConfig,
+    private readonly signalStore: ResolutionSignalStore,
     private readonly riskManager: RiskManager,
     private readonly executionEngine: ExecutionEngine,
     private readonly alerts: AlertService,
@@ -46,7 +48,7 @@ export class ArbitrageEngine extends EventEmitter {
     super();
   }
 
-  getStats(): ArbitrageEngineStats {
+  getStats(): LateResolutionStats {
     return {
       opportunitiesSeen: this.opportunitiesSeen,
       opportunitiesViable: this.opportunitiesViable,
@@ -76,121 +78,108 @@ export class ArbitrageEngine extends EventEmitter {
   }
 
   private async evaluateMarket(state: MarketBookState): Promise<void> {
-    const bestYesAsk = state.yes.bestAsk ?? state.yes.asks[0]?.price;
-    const bestNoAsk = state.no.bestAsk ?? state.no.asks[0]?.price;
-    if (bestYesAsk === undefined || bestNoAsk === undefined) {
-      this.expireMarketOpportunities(state.market.conditionId, Date.now());
-      return;
-    }
-
-    const arb = bestYesAsk + bestNoAsk;
-    if (arb >= 1 - this.config.arbitrageBuffer) {
-      this.expireMarketOpportunities(state.market.conditionId, Date.now());
-      return;
-    }
-
     const now = Date.now();
-    const direction = deriveOpportunityDirection(bestYesAsk, bestNoAsk);
-    const opportunityKey = this.buildOpportunityKey(state.market.conditionId, direction);
+    this.pruneConsumedSignals(now);
+    const signal = this.signalStore.getSignal(state.market, now);
+    if (!signal) {
+      this.expireMarketOpportunities(state.market.conditionId, now);
+      return;
+    }
+
+    const opportunityKey = this.buildOpportunityKey(state.market.conditionId, signal.resolvedOutcome);
+    const signalExecutionKey = this.buildSignalExecutionKey(state.market.conditionId, signal);
     const oppositeKey = this.buildOpportunityKey(
       state.market.conditionId,
-      direction === "YES_high" ? "NO_high" : "YES_high",
+      signal.resolvedOutcome === "YES" ? "NO" : "YES",
     );
 
     this.finalizeOpportunity(oppositeKey, now);
 
+    if (this.consumedSignalExecutions.has(signalExecutionKey)) {
+      this.finalizeOpportunity(opportunityKey, now);
+      return;
+    }
+
+    const assessment = await this.riskManager.evaluateLateResolution(
+      state,
+      signal.resolvedOutcome,
+      signal.source,
+    );
+
+    if (!assessment.viable) {
+      this.finalizeOpportunity(opportunityKey, now);
+      if (assessment.reason) {
+        this.logger.debug(
+          {
+            market: state.market.slug,
+            strategy: "late_resolution",
+            resolvedOutcome: signal.resolvedOutcome,
+            tradeSize: assessment.tradeSize,
+            expectedProfitUsd: assessment.expectedProfitUsd,
+            expectedProfitPct: assessment.expectedProfitPct,
+            grossEdgeUsd: assessment.grossEdgeUsd,
+            totalFeesUsd: assessment.totalFeesUsd,
+            estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+            gasUsd: assessment.gasUsd,
+            reason: assessment.reason,
+          },
+          "Late-resolution opportunity rejected by risk manager",
+        );
+      }
+      return;
+    }
+
     let activeWindow = this.activeOpportunityWindows.get(opportunityKey);
+    if (activeWindow) {
+      const activeSignalKey = this.buildSignalExecutionKey(state.market.conditionId, activeWindow.signal);
+      if (activeSignalKey !== signalExecutionKey) {
+        this.finalizeOpportunity(opportunityKey, now);
+        activeWindow = undefined;
+      }
+    }
+
     if (!activeWindow) {
       this.opportunitiesSeen += 1;
       activeWindow = {
         detectedAt: now,
-        direction,
+        signal,
         countedViable: false,
         attemptedExecution: false,
         lastRecord: {
           type: "opportunity",
-          timestamp: now,
+          timestamp: assessment.timestamp,
           marketId: state.market.conditionId,
           slug: state.market.slug,
           question: state.market.question,
-          strategyType: "binary_arb",
-          direction,
-          arb,
-          tradeSize: 0,
-          expectedProfitUsd: 0,
-          expectedProfitPct: 0,
-          viable: false,
+          strategyType: "late_resolution",
+          resolvedOutcome: signal.resolvedOutcome,
+          arb: assessment.leg.bestAsk,
+          tradeSize: assessment.tradeSize,
+          grossEdgeUsd: assessment.grossEdgeUsd,
+          totalFeesUsd: assessment.totalFeesUsd,
+          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+          expectedProfitUsd: assessment.expectedProfitUsd,
+          expectedProfitPct: assessment.expectedProfitPct,
+          viable: true,
           detectedAt: now,
-          reason: "Risk assessment pending",
+          reason: "Late-resolution risk assessment pending",
         },
-        lastAssessment: {
-          viable: false,
-          reason: "Pending first assessment",
-          market: state.market,
-          timestamp: now,
-          direction,
-          tradeSize: 0,
-          yes: {
-            requestedSize: 0,
-            executableSize: 0,
-            totalCost: 0,
-            averagePrice: 0,
-            worstPrice: 0,
-            slippagePct: 0,
-            levelsConsumed: 0,
-            bestAsk: 0,
-            fee: {
-              feeRateBps: 0,
-              feeRate: 0,
-              feeExponent: 1,
-              feeUsd: 0,
-              feeShares: 0,
-            },
-          },
-          no: {
-            requestedSize: 0,
-            executableSize: 0,
-            totalCost: 0,
-            averagePrice: 0,
-            worstPrice: 0,
-            slippagePct: 0,
-            levelsConsumed: 0,
-            bestAsk: 0,
-            fee: {
-              feeRateBps: 0,
-              feeRate: 0,
-              feeExponent: 1,
-              feeUsd: 0,
-              feeShares: 0,
-            },
-          },
-          arb,
-          guaranteedPayoutUsd: 0,
-          grossEdgeUsd: 0,
-          totalFeesUsd: 0,
-          estimatedSlippageUsd: 0,
-          totalSpendUsd: 0,
-          gasUsd: 0,
-          expectedProfitUsd: 0,
-          expectedProfitPct: 0,
-          netEdgePerShare: 0,
-        },
+        lastAssessment: assessment,
       };
       this.activeOpportunityWindows.set(opportunityKey, activeWindow);
     }
 
     this.lastOpportunityAt = now;
 
-    const assessment = await this.riskManager.evaluate(state);
     const opportunityRecord: OpportunityLogRecord = {
       type: "opportunity",
       timestamp: assessment.timestamp,
       marketId: state.market.conditionId,
       slug: state.market.slug,
       question: state.market.question,
-      strategyType: "binary_arb",
-      direction,
-      arb,
+      strategyType: "late_resolution",
+      resolvedOutcome: signal.resolvedOutcome,
+      arb: assessment.leg.bestAsk,
       tradeSize: assessment.tradeSize,
       grossEdgeUsd: assessment.grossEdgeUsd,
       totalFeesUsd: assessment.totalFeesUsd,
@@ -202,28 +191,10 @@ export class ArbitrageEngine extends EventEmitter {
       reason: assessment.reason,
     };
 
+    activeWindow.signal = signal;
     activeWindow.lastAssessment = assessment;
     activeWindow.lastRecord = opportunityRecord;
     this.emit("opportunity", opportunityRecord);
-
-    if (!assessment.viable) {
-      this.logger.debug(
-        {
-          market: state.market.slug,
-          arb,
-          tradeSize: assessment.tradeSize,
-          expectedProfitUsd: assessment.expectedProfitUsd,
-          expectedProfitPct: assessment.expectedProfitPct,
-          grossEdgeUsd: assessment.grossEdgeUsd,
-          totalFeesUsd: assessment.totalFeesUsd,
-          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
-          gasUsd: assessment.gasUsd,
-          reason: assessment.reason,
-        },
-        "Opportunity rejected by risk manager",
-      );
-      return;
-    }
 
     if (!activeWindow.countedViable) {
       this.opportunitiesViable += 1;
@@ -246,7 +217,8 @@ export class ArbitrageEngine extends EventEmitter {
     this.riskManager.markOpportunityTriggered(opportunityKey, now);
     await this.alerts.notifyOpportunity(assessment);
 
-    const result = await this.executionEngine.execute(assessment);
+    const result = await this.executionEngine.executeLateResolution(assessment);
+    this.consumedSignalExecutions.set(signalExecutionKey, result.timestamp);
     if (result.success) {
       this.opportunitiesExecuted += 1;
     }
@@ -272,6 +244,7 @@ export class ArbitrageEngine extends EventEmitter {
     });
 
     await this.alerts.notifyTrade(result);
+    this.finalizeOpportunity(opportunityKey, Date.now());
   }
 
   private expireMarketOpportunities(conditionId: string, expiredAt: number): void {
@@ -299,11 +272,25 @@ export class ArbitrageEngine extends EventEmitter {
     });
   }
 
-  private buildOpportunityKey(
-    conditionId: string,
-    direction: ArbitrageDirection,
-  ): string {
-    return `${conditionId}:${direction}`;
+  private buildOpportunityKey(conditionId: string, outcome: "YES" | "NO"): string {
+    return `${conditionId}:${outcome}`;
+  }
+
+  private buildSignalExecutionKey(conditionId: string, signal: LateResolutionSignal): string {
+    return [
+      conditionId,
+      signal.resolvedOutcome,
+      signal.source,
+      String(signal.resolvedAt),
+    ].join(":");
+  }
+
+  private pruneConsumedSignals(now: number): void {
+    for (const [key, consumedAt] of this.consumedSignalExecutions.entries()) {
+      if (now - consumedAt > this.config.lateResolutionMaxSignalAgeMs) {
+        this.consumedSignalExecutions.delete(key);
+      }
+    }
   }
 
   private async drainEvaluationQueue(
