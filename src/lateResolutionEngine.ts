@@ -241,6 +241,14 @@ export class LateResolutionEngine extends EventEmitter {
       orderIds: result.orderIds,
       hedgeOrderIds: result.hedgeOrderIds,
       notes: result.notes,
+      settlementAction: result.settlementAction,
+      settlementTxHash: result.settlementTxHash,
+      settlementAmount: result.settlementAmount,
+      settlementBlockNumber: result.settlementBlockNumber,
+      reconciledAt: result.reconciledAt,
+      reconciliationSatisfied: result.reconciliationSatisfied,
+      reconciledPortfolioValueUsd: result.reconciledPortfolioValueUsd,
+      reconciledPositionCount: result.reconciledPositionCount,
     });
 
     await this.alerts.notifyTrade(result);

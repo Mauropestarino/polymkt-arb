@@ -2,30 +2,30 @@ import { EventEmitter } from "node:events";
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import type {
-  ArbitrageDirection,
   ArbitrageEngineStats,
   MarketBookState,
+  NegRiskAssessment,
+  NegRiskGroup,
   OpportunityLogRecord,
-  RiskAssessment,
 } from "./types.js";
 import { AlertService } from "./alerts.js";
 import { ExecutionEngine } from "./executionEngine.js";
 import { EventJournal } from "./lib/journal.js";
-import { deriveOpportunityDirection } from "./lib/arbitrageMath.js";
+import { OrderBookStore } from "./orderBookStore.js";
+import { NegRiskCatalog } from "./negRiskCatalog.js";
 import { RiskManager } from "./riskManager.js";
 
 interface ActiveOpportunityWindow {
   detectedAt: number;
-  direction: ArbitrageDirection;
   lastRecord: OpportunityLogRecord;
-  lastAssessment: RiskAssessment;
+  lastAssessment: NegRiskAssessment;
   countedViable: boolean;
   attemptedExecution: boolean;
 }
 
-export class ArbitrageEngine extends EventEmitter {
+export class NegRiskEngine extends EventEmitter {
   private readonly evaluationScheduled = new Set<string>();
-  private readonly pendingStates = new Map<string, MarketBookState>();
+  private readonly pendingGroups = new Set<string>();
   private readonly activeOpportunityWindows = new Map<string, ActiveOpportunityWindow>();
   private opportunitiesSeen = 0;
   private opportunitiesViable = 0;
@@ -37,6 +37,8 @@ export class ArbitrageEngine extends EventEmitter {
 
   constructor(
     private readonly config: BotConfig,
+    private readonly catalog: NegRiskCatalog,
+    private readonly store: OrderBookStore,
     private readonly riskManager: RiskManager,
     private readonly executionEngine: ExecutionEngine,
     private readonly alerts: AlertService,
@@ -63,59 +65,132 @@ export class ArbitrageEngine extends EventEmitter {
   }
 
   handleMarketUpdate(state: MarketBookState): void {
-    const conditionId = state.market.conditionId;
-    if (this.evaluationScheduled.has(conditionId)) {
-      this.pendingStates.set(conditionId, state);
+    const group = this.catalog.getGroupByConditionId(state.market.conditionId);
+    if (!group) {
       return;
     }
 
-    this.evaluationScheduled.add(conditionId);
+    if (this.evaluationScheduled.has(group.id)) {
+      this.pendingGroups.add(group.id);
+      return;
+    }
+
+    this.evaluationScheduled.add(group.id);
     queueMicrotask(() => {
-      void this.drainEvaluationQueue(conditionId, state);
+      void this.drainEvaluationQueue(group.id);
     });
   }
 
-  private async evaluateMarket(state: MarketBookState): Promise<void> {
-    const bestYesAsk = state.yes.bestAsk ?? state.yes.asks[0]?.price;
-    const bestNoAsk = state.no.bestAsk ?? state.no.asks[0]?.price;
-    if (bestYesAsk === undefined || bestNoAsk === undefined) {
-      this.expireMarketOpportunities(state.market.conditionId, Date.now());
+  private async drainEvaluationQueue(groupId: string): Promise<void> {
+    try {
+      while (true) {
+        this.pendingGroups.delete(groupId);
+        await this.evaluateGroup(groupId);
+        if (!this.pendingGroups.has(groupId)) {
+          break;
+        }
+      }
+    } finally {
+      this.evaluationScheduled.delete(groupId);
+      if (this.pendingGroups.has(groupId)) {
+        this.handlePendingGroup(groupId);
+      }
+    }
+  }
+
+  private handlePendingGroup(groupId: string): void {
+    const group = this.catalog.getGroupById(groupId);
+    if (!group) {
+      this.pendingGroups.delete(groupId);
       return;
     }
 
-    const arb = bestYesAsk + bestNoAsk;
-    if (arb >= 1 - this.config.arbitrageBuffer) {
-      this.expireMarketOpportunities(state.market.conditionId, Date.now());
+    const firstState = this.store.getMarket(group.members[0]?.conditionId ?? "");
+    if (!firstState) {
       return;
     }
 
+    this.handleMarketUpdate(firstState);
+  }
+
+  private async evaluateGroup(groupId: string): Promise<void> {
+    const group = this.catalog.getGroupById(groupId);
+    if (!group) {
+      return;
+    }
+
+    const statesByConditionId = new Map<string, MarketBookState>();
+    for (const member of group.members) {
+      const state = this.store.getMarket(member.conditionId);
+      if (state) {
+        statesByConditionId.set(member.conditionId, state);
+      }
+    }
+
+    for (const member of group.members) {
+      const sourceState = statesByConditionId.get(member.conditionId);
+      if (!sourceState) {
+        this.finalizeOpportunity(this.buildOpportunityKey(group.id, member.conditionId), Date.now());
+        continue;
+      }
+
+      const targetStates = group.members
+        .filter((candidate) => candidate.conditionId !== member.conditionId)
+        .map((candidate) => statesByConditionId.get(candidate.conditionId))
+        .filter((state): state is MarketBookState => Boolean(state));
+
+      await this.evaluateSource(group, sourceState, targetStates);
+    }
+  }
+
+  private async evaluateSource(
+    group: NegRiskGroup,
+    sourceState: MarketBookState,
+    targetStates: MarketBookState[],
+  ): Promise<void> {
     const now = Date.now();
-    const direction = deriveOpportunityDirection(bestYesAsk, bestNoAsk);
-    const opportunityKey = this.buildOpportunityKey(state.market.conditionId, direction);
-    const oppositeKey = this.buildOpportunityKey(
-      state.market.conditionId,
-      direction === "YES_high" ? "NO_high" : "YES_high",
+    const sourceMember = group.members.find(
+      (member) => member.conditionId === sourceState.market.conditionId,
     );
+    if (!sourceMember) {
+      return;
+    }
 
-    this.finalizeOpportunity(oppositeKey, now);
+    const bestNoAsk = sourceState.no.bestAsk ?? sourceState.no.asks[0]?.price;
+    const convertMultiplier = 1 - (group.convertFeeBps / 10_000);
+    const bestSyntheticProceeds =
+      convertMultiplier > 0
+        ? targetStates.reduce((total, state) => total + (state.yes.bestBid ?? state.yes.bids[0]?.price ?? 0), 0) * convertMultiplier
+        : 0;
+    const rawSpread =
+      bestNoAsk !== undefined && targetStates.length === group.members.length - 1
+        ? bestSyntheticProceeds - bestNoAsk
+        : 0;
+    const opportunityKey = this.buildOpportunityKey(group.id, sourceState.market.conditionId);
+
+    if (bestNoAsk === undefined || targetStates.length !== group.members.length - 1 || rawSpread <= this.config.arbitrageBuffer) {
+      this.finalizeOpportunity(opportunityKey, now);
+      return;
+    }
 
     let activeWindow = this.activeOpportunityWindows.get(opportunityKey);
     if (!activeWindow) {
       this.opportunitiesSeen += 1;
       activeWindow = {
         detectedAt: now,
-        direction,
         countedViable: false,
         attemptedExecution: false,
         lastRecord: {
           type: "opportunity",
           timestamp: now,
-          marketId: state.market.conditionId,
-          slug: state.market.slug,
-          question: state.market.question,
-          strategyType: "binary_arb",
-          direction,
-          arb,
+          marketId: sourceState.market.conditionId,
+          slug: sourceState.market.slug,
+          question: sourceState.market.question,
+          groupId: group.id,
+          groupSlug: group.slug,
+          groupQuestion: group.title,
+          strategyType: "neg_risk_arb",
+          arb: rawSpread,
           tradeSize: 0,
           expectedProfitUsd: 0,
           expectedProfitPct: 0,
@@ -126,11 +201,19 @@ export class ArbitrageEngine extends EventEmitter {
         lastAssessment: {
           viable: false,
           reason: "Pending first assessment",
-          market: state.market,
+          strategyType: "neg_risk_arb",
+          market: sourceState.market,
           timestamp: now,
-          direction,
           tradeSize: 0,
-          yes: {
+          groupId: group.id,
+          groupSlug: group.slug,
+          groupQuestion: group.title,
+          sourceOutcomeIndex: sourceMember.outcomeIndex,
+          negRiskMarketId: group.negRiskMarketId,
+          convertFeeBps: group.convertFeeBps,
+          convertOutputSize: 0,
+          sourceNo: {
+            tokenId: sourceState.market.noTokenId,
             requestedSize: 0,
             executableSize: 0,
             totalCost: 0,
@@ -147,29 +230,13 @@ export class ArbitrageEngine extends EventEmitter {
               feeShares: 0,
             },
           },
-          no: {
-            requestedSize: 0,
-            executableSize: 0,
-            totalCost: 0,
-            averagePrice: 0,
-            worstPrice: 0,
-            slippagePct: 0,
-            levelsConsumed: 0,
-            bestAsk: 0,
-            fee: {
-              feeRateBps: 0,
-              feeRate: 0,
-              feeExponent: 1,
-              feeUsd: 0,
-              feeShares: 0,
-            },
-          },
-          arb,
-          guaranteedPayoutUsd: 0,
+          targetYesLegs: [],
+          arb: rawSpread,
           grossEdgeUsd: 0,
           totalFeesUsd: 0,
           estimatedSlippageUsd: 0,
           totalSpendUsd: 0,
+          totalProceedsUsd: 0,
           gasUsd: 0,
           expectedProfitUsd: 0,
           expectedProfitPct: 0,
@@ -180,17 +247,18 @@ export class ArbitrageEngine extends EventEmitter {
     }
 
     this.lastOpportunityAt = now;
-
-    const assessment = await this.riskManager.evaluate(state);
+    const assessment = await this.riskManager.evaluateNegRisk(group, sourceState, targetStates);
     const opportunityRecord: OpportunityLogRecord = {
       type: "opportunity",
       timestamp: assessment.timestamp,
-      marketId: state.market.conditionId,
-      slug: state.market.slug,
-      question: state.market.question,
-      strategyType: "binary_arb",
-      direction,
-      arb,
+      marketId: sourceState.market.conditionId,
+      slug: sourceState.market.slug,
+      question: sourceState.market.question,
+      groupId: group.id,
+      groupSlug: group.slug,
+      groupQuestion: group.title,
+      strategyType: "neg_risk_arb",
+      arb: assessment.arb,
       tradeSize: assessment.tradeSize,
       grossEdgeUsd: assessment.grossEdgeUsd,
       totalFeesUsd: assessment.totalFeesUsd,
@@ -209,18 +277,14 @@ export class ArbitrageEngine extends EventEmitter {
     if (!assessment.viable) {
       this.logger.debug(
         {
-          market: state.market.slug,
-          arb,
+          group: group.slug,
+          source: sourceState.market.slug,
+          arb: assessment.arb,
           tradeSize: assessment.tradeSize,
           expectedProfitUsd: assessment.expectedProfitUsd,
-          expectedProfitPct: assessment.expectedProfitPct,
-          grossEdgeUsd: assessment.grossEdgeUsd,
-          totalFeesUsd: assessment.totalFeesUsd,
-          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
-          gasUsd: assessment.gasUsd,
           reason: assessment.reason,
         },
-        "Opportunity rejected by risk manager",
+        "Neg-risk opportunity rejected by risk manager",
       );
       return;
     }
@@ -234,7 +298,7 @@ export class ArbitrageEngine extends EventEmitter {
       return;
     }
 
-    if (this.executionEngine.isBusy(state.market.conditionId)) {
+    if (this.executionEngine.isBusy(group.id)) {
       return;
     }
 
@@ -246,7 +310,7 @@ export class ArbitrageEngine extends EventEmitter {
     this.riskManager.markOpportunityTriggered(opportunityKey, now);
     await this.alerts.notifyOpportunity(assessment);
 
-    const result = await this.executionEngine.execute(assessment);
+    const result = await this.executionEngine.executeNegRisk(assessment);
     if (result.success) {
       this.opportunitiesExecuted += 1;
     }
@@ -259,6 +323,9 @@ export class ArbitrageEngine extends EventEmitter {
       marketId: result.market.conditionId,
       slug: result.market.slug,
       question: result.market.question,
+      groupId: result.groupId,
+      groupSlug: result.groupSlug,
+      groupQuestion: result.groupQuestion,
       strategyType: result.strategyType,
       resolvedOutcome: result.resolvedOutcome,
       tradeSize: result.tradeSize,
@@ -282,12 +349,8 @@ export class ArbitrageEngine extends EventEmitter {
     await this.alerts.notifyTrade(result);
   }
 
-  private expireMarketOpportunities(conditionId: string, expiredAt: number): void {
-    for (const key of [...this.activeOpportunityWindows.keys()]) {
-      if (key.startsWith(`${conditionId}:`)) {
-        this.finalizeOpportunity(key, expiredAt);
-      }
-    }
+  private buildOpportunityKey(groupId: string, sourceConditionId: string): string {
+    return `${groupId}:${sourceConditionId}`;
   }
 
   private finalizeOpportunity(opportunityKey: string, expiredAt: number): void {
@@ -305,37 +368,5 @@ export class ArbitrageEngine extends EventEmitter {
       expiredAt,
       opportunity_duration_ms: durationMs,
     });
-  }
-
-  private buildOpportunityKey(
-    conditionId: string,
-    direction: ArbitrageDirection,
-  ): string {
-    return `${conditionId}:${direction}`;
-  }
-
-  private async drainEvaluationQueue(
-    conditionId: string,
-    initialState: MarketBookState,
-  ): Promise<void> {
-    try {
-      let nextState: MarketBookState | undefined = initialState;
-
-      while (true) {
-        if (!nextState) {
-          break;
-        }
-
-        await this.evaluateMarket(nextState);
-        nextState = this.pendingStates.get(conditionId);
-        this.pendingStates.delete(conditionId);
-      }
-    } finally {
-      this.evaluationScheduled.delete(conditionId);
-
-      if (this.pendingStates.has(conditionId)) {
-        this.handleMarketUpdate(this.pendingStates.get(conditionId)!);
-      }
-    }
   }
 }

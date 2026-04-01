@@ -556,6 +556,23 @@ export class MarketScanner extends EventEmitter {
         this.onMarketState(state);
         break;
       }
+      case "tick_size_change": {
+        const assetId = String(message.asset_id ?? "");
+        const newTickSize = Number(message.new_tick_size ?? 0);
+        if (!assetId || !Number.isFinite(newTickSize) || newTickSize <= 0) {
+          break;
+        }
+
+        this.wallet.publicClient.clearTickSizeCache(assetId);
+        const state = this.store.applyTickSizeChange(
+          assetId,
+          newTickSize,
+          Number(message.timestamp ?? Date.now()),
+        );
+        this.logger.info({ assetId, newTickSize }, "Updated token tick size from WebSocket");
+        this.onMarketState(state);
+        break;
+      }
       case "new_market": {
         const market = this.normalizeMarket({
           id: message.id,

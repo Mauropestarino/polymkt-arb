@@ -5,6 +5,7 @@ import type {
   LateResolutionStats,
   MarketScannerStats,
   OpportunityLogRecord,
+  TradingGuardStatus,
 } from "./types.js";
 import { formatMs, formatPct, formatUsd } from "./lib/utils.js";
 
@@ -16,8 +17,11 @@ export class CliDashboard {
     private readonly startedAt: number,
     private readonly getScannerStats: () => MarketScannerStats,
     private readonly getArbitrageStats: () => ArbitrageEngineStats,
+    private readonly getCeilingArbitrageStats: (() => ArbitrageEngineStats | undefined) | undefined,
+    private readonly getNegRiskArbitrageStats: (() => ArbitrageEngineStats | undefined) | undefined,
     private readonly getExecutionStats: () => ExecutionStats,
     private readonly getLateResolutionStats?: () => LateResolutionStats,
+    private readonly getTradingGuardStatus?: () => TradingGuardStatus,
   ) {}
 
   pushOpportunity(record: OpportunityLogRecord): void {
@@ -45,8 +49,11 @@ export class CliDashboard {
       startedAt: this.startedAt,
       scanner: this.getScannerStats(),
       arbitrage: this.getArbitrageStats(),
+      ceilingArbitrage: this.getCeilingArbitrageStats?.(),
+      negRiskArbitrage: this.getNegRiskArbitrageStats?.(),
       lateResolution: this.getLateResolutionStats?.(),
       execution: this.getExecutionStats(),
+      tradingGuard: this.getTradingGuardStatus?.(),
       recentOpportunities: [...this.recentOpportunities],
     };
   }
@@ -55,9 +62,15 @@ export class CliDashboard {
     const snapshot = this.snapshot();
     const uptimeSeconds = Math.max(1, Math.floor((Date.now() - snapshot.startedAt) / 1000));
     const totalOpportunitiesSeen =
-      snapshot.arbitrage.opportunitiesSeen + (snapshot.lateResolution?.opportunitiesSeen ?? 0);
+      snapshot.arbitrage.opportunitiesSeen +
+      (snapshot.ceilingArbitrage?.opportunitiesSeen ?? 0) +
+      (snapshot.negRiskArbitrage?.opportunitiesSeen ?? 0) +
+      (snapshot.lateResolution?.opportunitiesSeen ?? 0);
     const totalCapturedOpportunities =
-      snapshot.arbitrage.opportunitiesCaptured + (snapshot.lateResolution?.opportunitiesCaptured ?? 0);
+      snapshot.arbitrage.opportunitiesCaptured +
+      (snapshot.ceilingArbitrage?.opportunitiesCaptured ?? 0) +
+      (snapshot.negRiskArbitrage?.opportunitiesCaptured ?? 0) +
+      (snapshot.lateResolution?.opportunitiesCaptured ?? 0);
     const captureRate =
       totalOpportunitiesSeen > 0
         ? totalCapturedOpportunities / totalOpportunitiesSeen
@@ -83,11 +96,30 @@ export class CliDashboard {
       `Binary arb: seen=${snapshot.arbitrage.opportunitiesSeen} captured=${snapshot.arbitrage.opportunitiesCaptured} viable=${snapshot.arbitrage.opportunitiesViable} executed=${snapshot.arbitrage.opportunitiesExecuted} avgDur=${formatMs(snapshot.arbitrage.averageOpportunityDurationMs)}`,
     );
     console.log(
+      `Binary ceiling: seen=${snapshot.ceilingArbitrage?.opportunitiesSeen ?? 0} captured=${snapshot.ceilingArbitrage?.opportunitiesCaptured ?? 0} viable=${snapshot.ceilingArbitrage?.opportunitiesViable ?? 0} executed=${snapshot.ceilingArbitrage?.opportunitiesExecuted ?? 0} avgDur=${formatMs(snapshot.ceilingArbitrage?.averageOpportunityDurationMs)}`,
+    );
+    console.log(
+      `Neg risk: seen=${snapshot.negRiskArbitrage?.opportunitiesSeen ?? 0} captured=${snapshot.negRiskArbitrage?.opportunitiesCaptured ?? 0} viable=${snapshot.negRiskArbitrage?.opportunitiesViable ?? 0} executed=${snapshot.negRiskArbitrage?.opportunitiesExecuted ?? 0} avgDur=${formatMs(snapshot.negRiskArbitrage?.averageOpportunityDurationMs)}`,
+    );
+    console.log(
       `Late resolution: seen=${snapshot.lateResolution?.opportunitiesSeen ?? 0} captured=${snapshot.lateResolution?.opportunitiesCaptured ?? 0} viable=${snapshot.lateResolution?.opportunitiesViable ?? 0} executed=${snapshot.lateResolution?.opportunitiesExecuted ?? 0} avgDur=${formatMs(snapshot.lateResolution?.averageOpportunityDurationMs)}`,
     );
     console.log(
       `Executions: attempted=${snapshot.execution.executionsAttempted} success=${snapshot.execution.executionsSucceeded} failed=${snapshot.execution.executionsFailed} hedges=${snapshot.execution.hedgesTriggered} fillRate=${formatPct(snapshot.execution.fillRate)} shareFill=${formatPct(snapshot.execution.shareFillRate)} openNotional=${formatUsd(snapshot.execution.openNotionalUsd)}`,
     );
+    if (snapshot.tradingGuard) {
+      console.log(
+        `Trading: ${
+          snapshot.tradingGuard.tradingEnabled ? "enabled" : "paused"
+        }${
+          snapshot.tradingGuard.pauseReason ? ` (${snapshot.tradingGuard.pauseReason})` : ""
+        }${
+          snapshot.tradingGuard.resumeAt
+            ? ` resume=${new Date(snapshot.tradingGuard.resumeAt).toLocaleTimeString("es-AR", { hour12: false })}`
+            : ""
+        }`,
+      );
+    }
     console.log(
       `Slippage: estimated=${formatUsd(snapshot.execution.estimatedSlippageUsdTotal)} realized=${formatUsd(snapshot.execution.realizedSlippageUsdTotal)}`,
     );

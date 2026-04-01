@@ -4,7 +4,11 @@ export interface OrderBookLevel {
 }
 
 export type ArbitrageDirection = "YES_high" | "NO_high";
-export type StrategyType = "binary_arb" | "late_resolution";
+export type StrategyType =
+  | "binary_arb"
+  | "binary_ceiling"
+  | "neg_risk_arb"
+  | "late_resolution";
 export type ResolutionOutcome = "YES" | "NO";
 
 export interface GammaMarket {
@@ -119,6 +123,94 @@ export interface RiskAssessment {
   netEdgePerShare: number;
 }
 
+export interface CeilingAssessment {
+  viable: boolean;
+  reason?: string;
+  strategyType: "binary_ceiling";
+  market: MarketDefinition;
+  timestamp: number;
+  direction: ArbitrageDirection;
+  tradeSize: number;
+  yes: FillEstimate & {
+    bestBid: number;
+    fee: FeeEstimate;
+  };
+  no: FillEstimate & {
+    bestBid: number;
+    fee: FeeEstimate;
+  };
+  arb: number;
+  collateralRequiredUsd: number;
+  grossEdgeUsd: number;
+  totalFeesUsd: number;
+  estimatedSlippageUsd: number;
+  totalProceedsUsd: number;
+  gasUsd: number;
+  expectedProfitUsd: number;
+  expectedProfitPct: number;
+  netEdgePerShare: number;
+}
+
+export interface NegRiskGroupMember {
+  conditionId: string;
+  marketId: string;
+  slug: string;
+  question: string;
+  outcomeIndex: number;
+}
+
+export interface NegRiskGroup {
+  id: string;
+  eventId: string;
+  slug: string;
+  title: string;
+  negRiskMarketId: string;
+  convertFeeBps: number;
+  augmented: boolean;
+  members: NegRiskGroupMember[];
+}
+
+export interface NegRiskAssessment {
+  viable: boolean;
+  reason?: string;
+  strategyType: "neg_risk_arb";
+  market: MarketDefinition;
+  timestamp: number;
+  tradeSize: number;
+  groupId: string;
+  groupSlug: string;
+  groupQuestion: string;
+  sourceOutcomeIndex: number;
+  negRiskMarketId: string;
+  convertFeeBps: number;
+  convertOutputSize: number;
+  sourceNo: FillEstimate & {
+    tokenId: string;
+    bestAsk: number;
+    fee: FeeEstimate;
+  };
+  targetYesLegs: Array<
+    FillEstimate & {
+      market: MarketDefinition;
+      tokenId: string;
+      bestBid: number;
+      fee: FeeEstimate;
+      outcomeIndex: number;
+      outputSize: number;
+    }
+  >;
+  arb: number;
+  grossEdgeUsd: number;
+  totalFeesUsd: number;
+  estimatedSlippageUsd: number;
+  totalSpendUsd: number;
+  totalProceedsUsd: number;
+  gasUsd: number;
+  expectedProfitUsd: number;
+  expectedProfitPct: number;
+  netEdgePerShare: number;
+}
+
 export interface OrderStatusSnapshot {
   orderId: string;
   status: string;
@@ -132,11 +224,69 @@ export interface OrderStatusSnapshot {
   associateTradeIds?: string[];
 }
 
+export interface SettlementReceipt {
+  action: "merge" | "split" | "redeem" | "convert";
+  conditionId: string;
+  amount: number;
+  txHash: string;
+  blockNumber?: number;
+  gasUsed?: string;
+  confirmedAt: number;
+}
+
+export interface PortfolioPosition {
+  proxyWallet: string;
+  asset: string;
+  conditionId: string;
+  size: number;
+  avgPrice?: number;
+  initialValue?: number;
+  currentValue?: number;
+  cashPnl?: number;
+  percentPnl?: number;
+  totalBought?: number;
+  realizedPnl?: number;
+  percentRealizedPnl?: number;
+  curPrice?: number;
+  redeemable?: boolean;
+  mergeable?: boolean;
+  title?: string;
+  slug?: string;
+  icon?: string;
+  eventSlug?: string;
+  outcome?: string;
+  outcomeIndex?: number;
+  oppositeOutcome?: string;
+  oppositeAsset?: string;
+  endDate?: string;
+  negativeRisk?: boolean;
+}
+
+export interface PortfolioValueSnapshot {
+  user: string;
+  value: number;
+}
+
+export interface PortfolioReconciliationResult {
+  user: string;
+  conditionId: string;
+  expectation: "flat" | "snapshot";
+  satisfied: boolean;
+  attempts: number;
+  reconciledAt: number;
+  positions: PortfolioPosition[];
+  totalValueUsd?: number;
+  notes: string[];
+}
+
 export interface ExecutionResult {
   mode: "live" | "paper" | "backtest";
   success: boolean;
   strategyType: StrategyType;
   market: MarketDefinition;
+  groupId?: string;
+  groupSlug?: string;
+  groupQuestion?: string;
   timestamp: number;
   tradeSize: number;
   resolvedOutcome?: ResolutionOutcome;
@@ -148,6 +298,14 @@ export interface ExecutionResult {
   notes: string[];
   hedged: boolean;
   hedgeOrderIds: string[];
+  settlementAction?: SettlementReceipt["action"];
+  settlementTxHash?: string;
+  settlementAmount?: number;
+  settlementBlockNumber?: number;
+  reconciledAt?: number;
+  reconciliationSatisfied?: boolean;
+  reconciledPortfolioValueUsd?: number;
+  reconciledPositionCount?: number;
 }
 
 export interface OpportunityLogRecord {
@@ -156,6 +314,9 @@ export interface OpportunityLogRecord {
   marketId: string;
   slug: string;
   question: string;
+  groupId?: string;
+  groupSlug?: string;
+  groupQuestion?: string;
   strategyType?: StrategyType;
   resolvedOutcome?: ResolutionOutcome;
   direction?: ArbitrageDirection;
@@ -181,6 +342,9 @@ export interface TradeLogRecord {
   marketId: string;
   slug: string;
   question: string;
+  groupId?: string;
+  groupSlug?: string;
+  groupQuestion?: string;
   strategyType?: StrategyType;
   resolvedOutcome?: ResolutionOutcome;
   tradeSize: number;
@@ -191,6 +355,14 @@ export interface TradeLogRecord {
   orderIds: string[];
   hedgeOrderIds: string[];
   notes: string[];
+  settlementAction?: SettlementReceipt["action"];
+  settlementTxHash?: string;
+  settlementAmount?: number;
+  settlementBlockNumber?: number;
+  reconciledAt?: number;
+  reconciliationSatisfied?: boolean;
+  reconciledPortfolioValueUsd?: number;
+  reconciledPositionCount?: number;
 }
 
 export interface PersistedMarketSnapshot {
@@ -247,6 +419,20 @@ export interface ExecutionStats {
   realizedSlippageUsdAverage: number;
 }
 
+export type TradingPauseReason =
+  | "rate_limit"
+  | "matching_engine_restart"
+  | "cancel_only"
+  | "trading_disabled";
+
+export interface TradingGuardStatus {
+  tradingEnabled: boolean;
+  pauseReason?: TradingPauseReason;
+  pauseMessage?: string;
+  pausedAt?: number;
+  resumeAt?: number;
+}
+
 export interface RuntimeState {
   startedAt: number;
   dryRun: boolean;
@@ -263,6 +449,9 @@ export interface RuntimeState {
   getEstimatedSlippageUsdTotal(): number;
   getRealizedSlippageUsdTotal(): number;
   getErrorsTotal(): number;
+  getTradingEnabled(): boolean;
+  getTradingPauseReason(): string | undefined;
+  getTradingResumeAt(): number | undefined;
 }
 
 export interface NetProfitModelInput {
@@ -272,6 +461,7 @@ export interface NetProfitModelInput {
   feeLeg2Usd: number;
   gasCostUsd: number;
   slippageTolerance: number;
+  estimatedSlippageUsd?: number;
 }
 
 export interface NetProfitModelOutput {
@@ -286,8 +476,11 @@ export interface DashboardSnapshot {
   startedAt: number;
   scanner: MarketScannerStats;
   arbitrage: ArbitrageEngineStats;
+  ceilingArbitrage?: ArbitrageEngineStats;
+  negRiskArbitrage?: ArbitrageEngineStats;
   lateResolution?: LateResolutionStats;
   execution: ExecutionStats;
+  tradingGuard?: TradingGuardStatus;
   recentOpportunities: OpportunityLogRecord[];
 }
 

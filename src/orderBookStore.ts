@@ -122,6 +122,33 @@ export class OrderBookStore {
     return this.getMarketByToken(tokenId);
   }
 
+  applyTickSizeChange(
+    tokenId: string,
+    tickSize: number,
+    timestamp: number,
+  ): MarketBookState | undefined {
+    const book = this.ensureBook(tokenId);
+    if (!book) {
+      return undefined;
+    }
+
+    book.tickSize = tickSize;
+    book.lastUpdatedAt = timestamp;
+
+    const conditionId = this.tokenToConditionId.get(tokenId);
+    if (conditionId) {
+      const market = this.marketsByConditionId.get(conditionId);
+      if (market) {
+        this.marketsByConditionId.set(conditionId, {
+          ...market,
+          tickSizeHint: tickSize,
+        });
+      }
+    }
+
+    return this.getMarketByToken(tokenId);
+  }
+
   getMarket(conditionId: string): MarketBookState | undefined {
     const market = this.marketsByConditionId.get(conditionId);
     if (!market) {

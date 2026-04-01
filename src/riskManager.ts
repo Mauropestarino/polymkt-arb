@@ -1,11 +1,15 @@
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import type {
+  ArbitrageDirection,
+  CeilingAssessment,
   FeeEstimate,
   FillEstimate,
   LateResolutionAssessment,
   MarketBookState,
   MarketDefinition,
+  NegRiskAssessment,
+  NegRiskGroup,
   ResolutionOutcome,
   RiskAssessment,
 } from "./types.js";
@@ -130,6 +134,9 @@ export class RiskManager {
       const yesFee = this.estimateFee(state.market, yesFill, yesFeeRateBps);
       const noFee = this.estimateFee(state.market, noFill, noFeeRateBps);
       const totalSpendUsd = yesFill.totalCost + noFill.totalCost;
+      const estimatedSlippageUsd =
+        this.estimateSweepSlippageUsd(yesFill, bestYesAsk) +
+        this.estimateSweepSlippageUsd(noFill, bestNoAsk);
       const profitModel = calculateNetProfitModel({
         tradeSize: candidateSize,
         totalSpendUsd,
@@ -137,6 +144,7 @@ export class RiskManager {
         feeLeg2Usd: noFee.feeUsd,
         gasCostUsd: this.config.gasCostUsd,
         slippageTolerance: this.config.slippageTolerance,
+        estimatedSlippageUsd,
       });
       const guaranteedPayoutUsd = candidateSize;
       const expectedProfitUsd = profitModel.netProfitUsd;
@@ -273,6 +281,7 @@ export class RiskManager {
 
       const fee = this.estimateFee(state.market, fill, feeRateBps);
       const totalSpendUsd = fill.totalCost;
+      const estimatedSlippageUsd = this.estimateSweepSlippageUsd(fill, bestAsk);
       const profitModel = calculateNetProfitModel({
         tradeSize: candidateSize,
         totalSpendUsd,
@@ -280,6 +289,7 @@ export class RiskManager {
         feeLeg2Usd: 0,
         gasCostUsd: this.config.gasCostUsd,
         slippageTolerance: this.config.slippageTolerance,
+        estimatedSlippageUsd,
       });
 
       if (
@@ -364,6 +374,496 @@ export class RiskManager {
     );
   }
 
+  async evaluateCeiling(
+    state: MarketBookState,
+    options?: { skipBalanceChecks?: boolean },
+  ): Promise<CeilingAssessment> {
+    const now = Date.now();
+    const bestYesBid = state.yes.bestBid ?? state.yes.bids[0]?.price;
+    const bestNoBid = state.no.bestBid ?? state.no.bids[0]?.price;
+    const direction =
+      bestYesBid !== undefined && bestNoBid !== undefined
+        ? deriveOpportunityDirection(bestYesBid, bestNoBid)
+        : "YES_high";
+
+    if (bestYesBid === undefined || bestNoBid === undefined) {
+      return this.buildCeilingFailure(state.market, now, direction, "Missing best bid on one or both legs.");
+    }
+
+    const roughArb = bestYesBid + bestNoBid;
+    if (roughArb <= 1 + this.config.arbitrageBuffer) {
+      return this.buildCeilingFailure(
+        state.market,
+        now,
+        direction,
+        `Raw ceiling ${roughArb.toFixed(5)} does not clear buffer ${this.config.arbitrageBuffer.toFixed(5)}.`,
+      );
+    }
+
+    if (state.yes.bids.length < this.config.minOrderbookLevels || state.no.bids.length < this.config.minOrderbookLevels) {
+      return this.buildCeilingFailure(
+        state.market,
+        now,
+        direction,
+        `Insufficient bid depth. yesLevels=${state.yes.bids.length}, noLevels=${state.no.bids.length}`,
+      );
+    }
+
+    const allowedYesBids = state.yes.bids.filter(
+      (level) => level.price >= bestYesBid * (1 - this.config.slippageTolerance),
+    );
+    const allowedNoBids = state.no.bids.filter(
+      (level) => level.price >= bestNoBid * (1 - this.config.slippageTolerance),
+    );
+
+    if (allowedYesBids.length === 0 || allowedNoBids.length === 0) {
+      return this.buildCeilingFailure(state.market, now, direction, "No executable bid depth inside slippage tolerance.");
+    }
+
+    const candidateSizes = this.buildCandidateSizes(
+      allowedYesBids,
+      allowedNoBids,
+      Math.min(
+        this.config.maxTradeSize,
+        this.cumulativeSize(allowedYesBids),
+        this.cumulativeSize(allowedNoBids),
+      ),
+    );
+
+    if (candidateSizes.length === 0) {
+      return this.buildCeilingFailure(state.market, now, direction, "No candidate size found within configured trade size.");
+    }
+
+    const [yesFeeRateBps, noFeeRateBps] = await Promise.all([
+      this.getFeeRateBps(state.market, state.yes.tokenId),
+      this.getFeeRateBps(state.market, state.no.tokenId),
+    ]);
+
+    if (!this.config.allowFeeMarkets && (yesFeeRateBps > 0 || noFeeRateBps > 0)) {
+      return this.buildCeilingFailure(state.market, now, direction, "Fee-enabled market skipped by configuration.");
+    }
+
+    let bestAssessment: CeilingAssessment | undefined;
+
+    for (const candidateSize of candidateSizes.toSorted((left, right) => right - left)) {
+      const yesFill = this.estimateSellFill(allowedYesBids, candidateSize);
+      const noFill = this.estimateSellFill(allowedNoBids, candidateSize);
+
+      if (yesFill.executableSize < candidateSize || noFill.executableSize < candidateSize) {
+        continue;
+      }
+
+      const yesFee = this.estimateFee(state.market, yesFill, yesFeeRateBps);
+      const noFee = this.estimateFee(state.market, noFill, noFeeRateBps);
+      const collateralRequiredUsd = round(candidateSize, 6);
+      const totalProceedsUsd = yesFill.totalCost + noFill.totalCost;
+      const estimatedSlippageUsd =
+        this.estimateSellSweepSlippageUsd(yesFill, bestYesBid) +
+        this.estimateSellSweepSlippageUsd(noFill, bestNoBid);
+      const grossEdgeUsd = totalProceedsUsd - collateralRequiredUsd;
+      const totalFeesUsd = yesFee.feeUsd + noFee.feeUsd;
+      const expectedProfitUsd = grossEdgeUsd - totalFeesUsd - this.config.gasCostUsd - estimatedSlippageUsd;
+      const expectedProfitPct =
+        collateralRequiredUsd > 0 ? expectedProfitUsd / collateralRequiredUsd : 0;
+
+      if (expectedProfitUsd <= 0 || expectedProfitPct < this.config.minProfitThreshold) {
+        continue;
+      }
+
+      const assessment: CeilingAssessment = {
+        viable: true,
+        strategyType: "binary_ceiling",
+        market: state.market,
+        timestamp: now,
+        direction,
+        tradeSize: round(candidateSize, 6),
+        yes: {
+          ...yesFill,
+          bestBid: bestYesBid,
+          fee: yesFee,
+        },
+        no: {
+          ...noFill,
+          bestBid: bestNoBid,
+          fee: noFee,
+        },
+        arb: roughArb,
+        collateralRequiredUsd,
+        grossEdgeUsd: round(grossEdgeUsd, 6),
+        totalFeesUsd: round(totalFeesUsd, 6),
+        estimatedSlippageUsd: round(estimatedSlippageUsd, 6),
+        totalProceedsUsd: round(totalProceedsUsd, 6),
+        gasUsd: this.config.gasCostUsd,
+        expectedProfitUsd: round(expectedProfitUsd, 6),
+        expectedProfitPct: round(expectedProfitPct, 6),
+        netEdgePerShare: round(expectedProfitUsd / candidateSize, 6),
+      };
+
+      if (!options?.skipBalanceChecks) {
+        const collateral = await this.wallet.getCollateralStatus();
+        const availableBuffer = this.config.maxOpenNotional - this.getOpenNotionalUsd();
+
+        if (collateral.balance < collateralRequiredUsd) {
+          return this.buildCeilingFailure(
+            state.market,
+            now,
+            direction,
+            `Insufficient balance. need=${collateralRequiredUsd.toFixed(4)} balance=${collateral.balance.toFixed(4)}`,
+          );
+        }
+
+        if (collateral.allowance < collateralRequiredUsd) {
+          return this.buildCeilingFailure(
+            state.market,
+            now,
+            direction,
+            `Insufficient allowance. need=${collateralRequiredUsd.toFixed(4)} allowance=${collateral.allowance.toFixed(4)}`,
+          );
+        }
+
+        if (availableBuffer < collateralRequiredUsd) {
+          return this.buildCeilingFailure(
+            state.market,
+            now,
+            direction,
+            `Open notional cap reached. available=${availableBuffer.toFixed(4)} need=${collateralRequiredUsd.toFixed(4)}`,
+          );
+        }
+      }
+
+      if (!bestAssessment || assessment.expectedProfitUsd > bestAssessment.expectedProfitUsd) {
+        bestAssessment = assessment;
+      }
+    }
+
+    return (
+      bestAssessment ??
+      this.buildCeilingFailure(
+        state.market,
+        now,
+        direction,
+        "No candidate size cleared min profit for ceiling arb after fees, gas, and slippage.",
+      )
+    );
+  }
+
+  async evaluateNegRisk(
+    group: NegRiskGroup,
+    sourceState: MarketBookState,
+    targetStates: MarketBookState[],
+    options?: { skipBalanceChecks?: boolean },
+  ): Promise<NegRiskAssessment> {
+    const now = Date.now();
+    const sourceMember = group.members.find(
+      (member) => member.conditionId === sourceState.market.conditionId,
+    );
+
+    if (!sourceMember) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Source market is not part of the neg-risk group.",
+        0,
+      );
+    }
+
+    if (targetStates.length !== group.members.length - 1) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Missing one or more target outcomes for neg-risk conversion.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const bestNoAsk = sourceState.no.bestAsk ?? sourceState.no.asks[0]?.price;
+    if (bestNoAsk === undefined) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Missing best ask on source NO leg.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const convertMultiplier = 1 - (group.convertFeeBps / 10_000);
+    if (convertMultiplier <= 0) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        `Neg-risk convert fee ${group.convertFeeBps} bps eliminates the output basket.`,
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const allowedNoAsks = sourceState.no.asks.filter(
+      (level) => level.price <= bestNoAsk * (1 + this.config.slippageTolerance),
+    );
+    if (allowedNoAsks.length < this.config.minOrderbookLevels) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Insufficient ask depth on source NO book.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const targetContexts = targetStates
+      .map((state) => {
+        const targetMember = group.members.find((member) => member.conditionId === state.market.conditionId);
+        const bestBid = state.yes.bestBid ?? state.yes.bids[0]?.price;
+        const allowedBids =
+          bestBid === undefined
+            ? []
+            : state.yes.bids.filter(
+                (level) => level.price >= bestBid * (1 - this.config.slippageTolerance),
+              );
+        return {
+          state,
+          member: targetMember,
+          bestBid,
+          allowedBids,
+        };
+      })
+      .filter(
+        (context): context is {
+          state: MarketBookState;
+          member: NegRiskGroup["members"][number];
+          bestBid: number;
+          allowedBids: Array<{ price: number; size: number }>;
+        } => Boolean(context.member && context.bestBid !== undefined),
+      );
+
+    if (targetContexts.length !== targetStates.length) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Missing best bid on one or more converted YES legs.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    if (targetContexts.some((context) => context.allowedBids.length < this.config.minOrderbookLevels)) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Insufficient bid depth on one or more converted YES legs.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const bestSyntheticProceedsPerShare = sum(
+      targetContexts.map((context) => context.bestBid * convertMultiplier),
+    );
+    const roughArb = bestSyntheticProceedsPerShare - bestNoAsk;
+    if (roughArb <= this.config.arbitrageBuffer) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        `Raw neg-risk spread ${roughArb.toFixed(5)} does not clear buffer ${this.config.arbitrageBuffer.toFixed(5)}.`,
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const candidateMaxSize = Math.min(
+      this.config.maxTradeSize,
+      this.cumulativeSize(allowedNoAsks),
+      ...targetContexts.map((context) => this.cumulativeSize(context.allowedBids) / convertMultiplier),
+    );
+
+    if (!Number.isFinite(candidateMaxSize) || candidateMaxSize <= 0) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "No executable neg-risk size found inside configured slippage limits.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const candidateSizes = this.buildCandidateSizesFromGroups(
+      [
+        allowedNoAsks,
+        ...targetContexts.map((context) =>
+          context.allowedBids.map((level) => ({
+            price: level.price,
+            size: level.size / convertMultiplier,
+          })),
+        ),
+      ],
+      candidateMaxSize,
+    );
+
+    if (candidateSizes.length === 0) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "No candidate size available for neg-risk evaluation.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    const feeRatePromises = [
+      this.getFeeRateBps(sourceState.market, sourceState.market.noTokenId),
+      ...targetContexts.map((context) => this.getFeeRateBps(context.state.market, context.state.market.yesTokenId)),
+    ];
+    const feeRates = await Promise.all(feeRatePromises);
+    const sourceFeeRateBps = feeRates[0] ?? 0;
+    const targetFeeRateBps = feeRates.slice(1);
+
+    if (!this.config.allowFeeMarkets && feeRates.some((rate) => rate > 0)) {
+      return this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "Fee-enabled neg-risk group skipped by configuration.",
+        sourceMember.outcomeIndex,
+      );
+    }
+
+    let bestAssessment: NegRiskAssessment | undefined;
+
+    for (const candidateSize of candidateSizes.toSorted((left, right) => right - left)) {
+      const sourceNoFill = this.estimateBuyFill(allowedNoAsks, candidateSize);
+      if (sourceNoFill.executableSize < candidateSize) {
+        continue;
+      }
+
+      const convertOutputSize = round(candidateSize * convertMultiplier, 6);
+      if (convertOutputSize <= 0) {
+        continue;
+      }
+
+      const targetFills = targetContexts.map((context) =>
+        this.estimateSellFill(context.allowedBids, convertOutputSize),
+      );
+      if (targetFills.some((fill) => fill.executableSize < convertOutputSize)) {
+        continue;
+      }
+
+      const sourceFee = this.estimateFee(sourceState.market, sourceNoFill, sourceFeeRateBps);
+      const targetLegs = targetContexts.map((context, index) => {
+        const fill = targetFills[index]!;
+        const fee = this.estimateFee(context.state.market, fill, targetFeeRateBps[index] ?? 0);
+        return {
+          ...fill,
+          market: context.state.market,
+          tokenId: context.state.market.yesTokenId,
+          bestBid: context.bestBid,
+          fee,
+          outcomeIndex: context.member.outcomeIndex,
+          outputSize: convertOutputSize,
+        };
+      });
+
+      const totalSpendUsd = sourceNoFill.totalCost;
+      const totalProceedsUsd = sum(targetLegs.map((leg) => leg.totalCost));
+      const totalFeesUsd = sourceFee.feeUsd + sum(targetLegs.map((leg) => leg.fee.feeUsd));
+      const estimatedSlippageUsd =
+        this.estimateSweepSlippageUsd(sourceNoFill, bestNoAsk) +
+        sum(targetLegs.map((leg) => this.estimateSellSweepSlippageUsd(leg, leg.bestBid)));
+      const grossEdgeUsd = totalProceedsUsd - totalSpendUsd;
+      const expectedProfitUsd =
+        grossEdgeUsd - totalFeesUsd - this.config.gasCostUsd - estimatedSlippageUsd;
+      const expectedProfitPct = totalSpendUsd > 0 ? expectedProfitUsd / totalSpendUsd : 0;
+
+      if (expectedProfitUsd <= 0 || expectedProfitPct < this.config.minProfitThreshold) {
+        continue;
+      }
+
+      if (!options?.skipBalanceChecks) {
+        const collateral = await this.wallet.getCollateralStatus();
+        const availableBuffer = this.config.maxOpenNotional - this.getOpenNotionalUsd();
+
+        if (collateral.balance < totalSpendUsd) {
+          return this.buildNegRiskFailure(
+            group,
+            sourceState.market,
+            now,
+            `Insufficient balance. need=${totalSpendUsd.toFixed(4)} balance=${collateral.balance.toFixed(4)}`,
+            sourceMember.outcomeIndex,
+          );
+        }
+
+        if (collateral.allowance < totalSpendUsd) {
+          return this.buildNegRiskFailure(
+            group,
+            sourceState.market,
+            now,
+            `Insufficient allowance. need=${totalSpendUsd.toFixed(4)} allowance=${collateral.allowance.toFixed(4)}`,
+            sourceMember.outcomeIndex,
+          );
+        }
+
+        if (availableBuffer < totalSpendUsd) {
+          return this.buildNegRiskFailure(
+            group,
+            sourceState.market,
+            now,
+            `Open notional cap reached. available=${availableBuffer.toFixed(4)} need=${totalSpendUsd.toFixed(4)}`,
+            sourceMember.outcomeIndex,
+          );
+        }
+      }
+
+      const assessment: NegRiskAssessment = {
+        viable: true,
+        strategyType: "neg_risk_arb",
+        market: sourceState.market,
+        timestamp: now,
+        tradeSize: round(candidateSize, 6),
+        groupId: group.id,
+        groupSlug: group.slug,
+        groupQuestion: group.title,
+        sourceOutcomeIndex: sourceMember.outcomeIndex,
+        negRiskMarketId: group.negRiskMarketId,
+        convertFeeBps: group.convertFeeBps,
+        convertOutputSize,
+        sourceNo: {
+          ...sourceNoFill,
+          tokenId: sourceState.market.noTokenId,
+          bestAsk: bestNoAsk,
+          fee: sourceFee,
+        },
+        targetYesLegs: targetLegs,
+        arb: round(roughArb, 6),
+        grossEdgeUsd: round(grossEdgeUsd, 6),
+        totalFeesUsd: round(totalFeesUsd, 6),
+        estimatedSlippageUsd: round(estimatedSlippageUsd, 6),
+        totalSpendUsd: round(totalSpendUsd, 6),
+        totalProceedsUsd: round(totalProceedsUsd, 6),
+        gasUsd: this.config.gasCostUsd,
+        expectedProfitUsd: round(expectedProfitUsd, 6),
+        expectedProfitPct: round(expectedProfitPct, 6),
+        netEdgePerShare: round(expectedProfitUsd / candidateSize, 6),
+      };
+
+      if (!bestAssessment || assessment.expectedProfitUsd > bestAssessment.expectedProfitUsd) {
+        bestAssessment = assessment;
+      }
+    }
+
+    return (
+      bestAssessment ??
+      this.buildNegRiskFailure(
+        group,
+        sourceState.market,
+        now,
+        "No candidate size cleared min profit for neg-risk arb after fees, gas, and slippage.",
+        sourceMember.outcomeIndex,
+      )
+    );
+  }
+
   private buildCandidateSizes(
     yesAsks: Array<{ price: number; size: number }>,
     noAsks: Array<{ price: number; size: number }>,
@@ -380,6 +880,24 @@ export class RiskManager {
     for (const level of noAsks) {
       cumulative += level.size;
       sizes.add(round(Math.min(cumulative, maxSize), 6));
+    }
+
+    sizes.add(round(maxSize, 6));
+    return [...sizes].filter((size) => size > 0 && size <= maxSize);
+  }
+
+  private buildCandidateSizesFromGroups(
+    groups: Array<Array<{ price: number; size: number }>>,
+    maxSize: number,
+  ): number[] {
+    const sizes = new Set<number>();
+
+    for (const levels of groups) {
+      let cumulative = 0;
+      for (const level of levels) {
+        cumulative += level.size;
+        sizes.add(round(Math.min(cumulative, maxSize), 6));
+      }
     }
 
     sizes.add(round(maxSize, 6));
@@ -428,11 +946,49 @@ export class RiskManager {
     };
   }
 
+  private estimateSellFill(levels: Array<{ price: number; size: number }>, requestedSize: number): FillEstimate {
+    let remaining = requestedSize;
+    let totalProceeds = 0;
+    let levelsConsumed = 0;
+    let worstPrice = 0;
+
+    for (const level of levels) {
+      if (remaining <= 0) {
+        break;
+      }
+
+      const take = Math.min(level.size, remaining);
+      if (take <= 0) {
+        continue;
+      }
+
+      totalProceeds += take * level.price;
+      remaining -= take;
+      levelsConsumed += 1;
+      worstPrice = level.price;
+    }
+
+    const executableSize = requestedSize - remaining;
+    const averagePrice = executableSize > 0 ? totalProceeds / executableSize : 0;
+    const bestBid = levels[0]?.price ?? averagePrice;
+    const slippagePct = bestBid > 0 ? (bestBid - worstPrice) / bestBid : 0;
+
+    return {
+      requestedSize: round(requestedSize, 6),
+      executableSize: round(executableSize, 6),
+      totalCost: round(totalProceeds, 6),
+      averagePrice: round(averagePrice, 6),
+      worstPrice: round(worstPrice, 6),
+      slippagePct: round(slippagePct, 6),
+      levelsConsumed,
+    };
+  }
+
   private estimateFee(market: MarketDefinition, fill: FillEstimate, feeRateBps: number): FeeEstimate {
     const feeRate = feeRateBps / 10_000;
     const feeExponent = this.getFeeExponent(market);
     const p = fill.averagePrice;
-    const feeUsd = fill.totalCost * feeRate;
+    const feeUsd = fill.executableSize * feeRate * p * (1 - p);
     const feeShares = p > 0 ? feeUsd / p : 0;
 
     return {
@@ -442,6 +998,24 @@ export class RiskManager {
       feeUsd: round(feeUsd, 6),
       feeShares: round(feeShares, 6),
     };
+  }
+
+  private estimateSweepSlippageUsd(fill: FillEstimate, bestAsk: number): number {
+    if (fill.executableSize <= 0 || bestAsk <= 0) {
+      return 0;
+    }
+
+    const baselineCost = fill.executableSize * bestAsk;
+    return round(Math.max(0, fill.totalCost - baselineCost), 6);
+  }
+
+  private estimateSellSweepSlippageUsd(fill: FillEstimate, bestBid: number): number {
+    if (fill.executableSize <= 0 || bestBid <= 0) {
+      return 0;
+    }
+
+    const baselineProceeds = fill.executableSize * bestBid;
+    return round(Math.max(0, baselineProceeds - fill.totalCost), 6);
   }
 
   private getFeeExponent(market: MarketDefinition): number {
@@ -528,6 +1102,67 @@ export class RiskManager {
     };
   }
 
+  private buildCeilingFailure(
+    market: MarketDefinition,
+    timestamp: number,
+    direction: ArbitrageDirection,
+    reason: string,
+  ): CeilingAssessment {
+    return {
+      viable: false,
+      reason,
+      strategyType: "binary_ceiling",
+      market,
+      timestamp,
+      direction,
+      tradeSize: 0,
+      yes: {
+        requestedSize: 0,
+        executableSize: 0,
+        totalCost: 0,
+        averagePrice: 0,
+        worstPrice: 0,
+        slippagePct: 0,
+        levelsConsumed: 0,
+        bestBid: 0,
+        fee: {
+          feeRateBps: 0,
+          feeRate: 0,
+          feeExponent: 1,
+          feeUsd: 0,
+          feeShares: 0,
+        },
+      },
+      no: {
+        requestedSize: 0,
+        executableSize: 0,
+        totalCost: 0,
+        averagePrice: 0,
+        worstPrice: 0,
+        slippagePct: 0,
+        levelsConsumed: 0,
+        bestBid: 0,
+        fee: {
+          feeRateBps: 0,
+          feeRate: 0,
+          feeExponent: 1,
+          feeUsd: 0,
+          feeShares: 0,
+        },
+      },
+      arb: 0,
+      collateralRequiredUsd: 0,
+      grossEdgeUsd: 0,
+      totalFeesUsd: 0,
+      estimatedSlippageUsd: 0,
+      totalProceedsUsd: 0,
+      gasUsd: this.config.gasCostUsd,
+      expectedProfitUsd: 0,
+      expectedProfitPct: 0,
+      netEdgePerShare: 0,
+    };
+  }
+
   private buildLateResolutionFailure(
     market: MarketDefinition,
     timestamp: number,
@@ -569,6 +1204,59 @@ export class RiskManager {
       expectedProfitUsd: 0,
       expectedProfitPct: 0,
       source,
+    };
+  }
+
+  private buildNegRiskFailure(
+    group: NegRiskGroup,
+    market: MarketDefinition,
+    timestamp: number,
+    reason: string,
+    sourceOutcomeIndex: number,
+  ): NegRiskAssessment {
+    return {
+      viable: false,
+      reason,
+      strategyType: "neg_risk_arb",
+      market,
+      timestamp,
+      tradeSize: 0,
+      groupId: group.id,
+      groupSlug: group.slug,
+      groupQuestion: group.title,
+      sourceOutcomeIndex,
+      negRiskMarketId: group.negRiskMarketId,
+      convertFeeBps: group.convertFeeBps,
+      convertOutputSize: 0,
+      sourceNo: {
+        tokenId: market.noTokenId,
+        requestedSize: 0,
+        executableSize: 0,
+        totalCost: 0,
+        averagePrice: 0,
+        worstPrice: 0,
+        slippagePct: 0,
+        levelsConsumed: 0,
+        bestAsk: 0,
+        fee: {
+          feeRateBps: 0,
+          feeRate: 0,
+          feeExponent: 1,
+          feeUsd: 0,
+          feeShares: 0,
+        },
+      },
+      targetYesLegs: [],
+      arb: 0,
+      grossEdgeUsd: 0,
+      totalFeesUsd: 0,
+      estimatedSlippageUsd: 0,
+      totalSpendUsd: 0,
+      totalProceedsUsd: 0,
+      gasUsd: this.config.gasCostUsd,
+      expectedProfitUsd: 0,
+      expectedProfitPct: 0,
+      netEdgePerShare: 0,
     };
   }
 }

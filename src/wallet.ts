@@ -4,7 +4,7 @@ import {
   type ApiKeyCreds,
   type ClobSigner,
 } from "@polymarket/clob-client";
-import { Wallet } from "ethers";
+import { JsonRpcProvider, Wallet } from "ethers";
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import { resolvePrivateKey } from "./secrets.js";
@@ -27,6 +27,7 @@ const createClobSigner = (wallet: Wallet): ClobSigner => ({
 
 export class WalletService {
   readonly publicClient: ClobClient;
+  readonly provider?: JsonRpcProvider;
   readonly signer?: Wallet;
   readonly apiCreds?: ApiKeyCreds;
   readonly tradingClient?: ClobClient;
@@ -38,12 +39,14 @@ export class WalletService {
     private readonly config: BotConfig,
     private readonly logger: Logger,
     publicClient: ClobClient,
+    provider?: JsonRpcProvider,
     signer?: Wallet,
     apiCreds?: ApiKeyCreds,
     tradingClient?: ClobClient,
     funderAddress?: string,
   ) {
     this.publicClient = publicClient;
+    this.provider = provider;
     this.signer = signer;
     this.apiCreds = apiCreds;
     this.tradingClient = tradingClient;
@@ -51,18 +54,47 @@ export class WalletService {
   }
 
   static async create(config: BotConfig, logger: Logger): Promise<WalletService> {
-    const publicClient = new ClobClient(config.clobApiUrl, config.chainId);
+    const publicClient = new ClobClient(
+      config.clobApiUrl,
+      config.chainId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
     const privateKey = await resolvePrivateKey(config);
 
     if (!privateKey) {
       return new WalletService(config, logger, publicClient);
     }
 
-    const signer = new Wallet(privateKey);
+    const provider = config.polygonRpcUrl ? new JsonRpcProvider(config.polygonRpcUrl) : undefined;
+    const signer = new Wallet(privateKey, provider);
     const clobSigner = createClobSigner(signer);
     const signerAddress = await signer.getAddress();
     const funderAddress = config.funderAddress ?? signerAddress;
-    const baseClient = new ClobClient(config.clobApiUrl, config.chainId, clobSigner);
+    const baseClient = new ClobClient(
+      config.clobApiUrl,
+      config.chainId,
+      clobSigner,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
 
     const apiCreds =
       config.polyApiKey && config.polyApiSecret && config.polyApiPassphrase
@@ -80,6 +112,13 @@ export class WalletService {
       apiCreds,
       config.polySignatureType,
       funderAddress,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
     );
 
     logger.info(
@@ -97,6 +136,7 @@ export class WalletService {
       config,
       logger,
       publicClient,
+      provider,
       signer,
       apiCreds,
       tradingClient,
@@ -108,6 +148,23 @@ export class WalletService {
     return Boolean(this.tradingClient);
   }
 
+  hasOnchainSigner(): boolean {
+    return Boolean(this.signer?.provider);
+  }
+
+  getProfileAddress(): string | undefined {
+    return this.funderAddress ?? this.signer?.address;
+  }
+
+  requireProfileAddress(): string {
+    const address = this.getProfileAddress();
+    if (!address) {
+      throw new Error("Wallet profile address is not initialized.");
+    }
+
+    return address;
+  }
+
   requireTradingClient(): ClobClient {
     if (!this.tradingClient) {
       throw new Error(
@@ -116,6 +173,16 @@ export class WalletService {
     }
 
     return this.tradingClient;
+  }
+
+  requireOnchainSigner(): Wallet {
+    if (!this.signer?.provider) {
+      throw new Error(
+        "On-chain signer is not initialized. Set POLYGON_RPC_URL with PRIVATE_KEY to enable CTF settlement.",
+      );
+    }
+
+    return this.signer;
   }
 
   async getCollateralStatus(force = false): Promise<CollateralStatus> {

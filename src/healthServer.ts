@@ -30,6 +30,9 @@ export const startHealthServer = async (
           average_opportunity_duration_ms: runtimeState.getAverageOpportunityDurationMs(),
           estimated_slippage_usd_total: runtimeState.getEstimatedSlippageUsdTotal(),
           realized_slippage_usd_total: runtimeState.getRealizedSlippageUsdTotal(),
+          trading_enabled: runtimeState.getTradingEnabled(),
+          trading_pause_reason: runtimeState.getTradingPauseReason(),
+          trading_resume_at: runtimeState.getTradingResumeAt(),
         }),
       );
       return;
@@ -49,6 +52,7 @@ export const startHealthServer = async (
           `average_opportunity_duration_ms ${runtimeState.getAverageOpportunityDurationMs()}`,
           `estimated_slippage_usd_total ${runtimeState.getEstimatedSlippageUsdTotal()}`,
           `realized_slippage_usd_total ${runtimeState.getRealizedSlippageUsdTotal()}`,
+          `trading_enabled ${runtimeState.getTradingEnabled() ? 1 : 0}`,
           `errors_total ${runtimeState.getErrorsTotal()}`,
         ].join("\n"),
       );

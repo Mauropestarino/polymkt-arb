@@ -14,7 +14,7 @@ Examples of sensitive data for this project:
 - wallet backup files such as `*.pem`, `*.key`, `*.p12`, `*.pfx`
 - generated trading logs in `data/`
 
-Use [`.env.example`](/C:/Users/pesta/OneDrive/Escritorio/polymarket/.env.example) as the public template and keep real secrets only in local environment files or GitHub repository secrets.
+Use [`.env.example`](./.env.example) as the public template and keep real secrets only in local environment files or GitHub repository secrets.
 
 ## Before pushing
 

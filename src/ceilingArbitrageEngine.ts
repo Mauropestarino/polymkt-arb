@@ -4,9 +4,9 @@ import type { BotConfig } from "./config.js";
 import type {
   ArbitrageDirection,
   ArbitrageEngineStats,
+  CeilingAssessment,
   MarketBookState,
   OpportunityLogRecord,
-  RiskAssessment,
 } from "./types.js";
 import { AlertService } from "./alerts.js";
 import { ExecutionEngine } from "./executionEngine.js";
@@ -18,12 +18,12 @@ interface ActiveOpportunityWindow {
   detectedAt: number;
   direction: ArbitrageDirection;
   lastRecord: OpportunityLogRecord;
-  lastAssessment: RiskAssessment;
+  lastAssessment: CeilingAssessment;
   countedViable: boolean;
   attemptedExecution: boolean;
 }
 
-export class ArbitrageEngine extends EventEmitter {
+export class CeilingArbitrageEngine extends EventEmitter {
   private readonly evaluationScheduled = new Set<string>();
   private readonly pendingStates = new Map<string, MarketBookState>();
   private readonly activeOpportunityWindows = new Map<string, ActiveOpportunityWindow>();
@@ -76,21 +76,21 @@ export class ArbitrageEngine extends EventEmitter {
   }
 
   private async evaluateMarket(state: MarketBookState): Promise<void> {
-    const bestYesAsk = state.yes.bestAsk ?? state.yes.asks[0]?.price;
-    const bestNoAsk = state.no.bestAsk ?? state.no.asks[0]?.price;
-    if (bestYesAsk === undefined || bestNoAsk === undefined) {
+    const bestYesBid = state.yes.bestBid ?? state.yes.bids[0]?.price;
+    const bestNoBid = state.no.bestBid ?? state.no.bids[0]?.price;
+    if (bestYesBid === undefined || bestNoBid === undefined) {
       this.expireMarketOpportunities(state.market.conditionId, Date.now());
       return;
     }
 
-    const arb = bestYesAsk + bestNoAsk;
-    if (arb >= 1 - this.config.arbitrageBuffer) {
+    const arb = bestYesBid + bestNoBid;
+    if (arb <= 1 + this.config.arbitrageBuffer) {
       this.expireMarketOpportunities(state.market.conditionId, Date.now());
       return;
     }
 
     const now = Date.now();
-    const direction = deriveOpportunityDirection(bestYesAsk, bestNoAsk);
+    const direction = deriveOpportunityDirection(bestYesBid, bestNoBid);
     const opportunityKey = this.buildOpportunityKey(state.market.conditionId, direction);
     const oppositeKey = this.buildOpportunityKey(
       state.market.conditionId,
@@ -113,7 +113,7 @@ export class ArbitrageEngine extends EventEmitter {
           marketId: state.market.conditionId,
           slug: state.market.slug,
           question: state.market.question,
-          strategyType: "binary_arb",
+          strategyType: "binary_ceiling",
           direction,
           arb,
           tradeSize: 0,
@@ -126,6 +126,7 @@ export class ArbitrageEngine extends EventEmitter {
         lastAssessment: {
           viable: false,
           reason: "Pending first assessment",
+          strategyType: "binary_ceiling",
           market: state.market,
           timestamp: now,
           direction,
@@ -138,7 +139,7 @@ export class ArbitrageEngine extends EventEmitter {
             worstPrice: 0,
             slippagePct: 0,
             levelsConsumed: 0,
-            bestAsk: 0,
+            bestBid: 0,
             fee: {
               feeRateBps: 0,
               feeRate: 0,
@@ -155,7 +156,7 @@ export class ArbitrageEngine extends EventEmitter {
             worstPrice: 0,
             slippagePct: 0,
             levelsConsumed: 0,
-            bestAsk: 0,
+            bestBid: 0,
             fee: {
               feeRateBps: 0,
               feeRate: 0,
@@ -165,11 +166,11 @@ export class ArbitrageEngine extends EventEmitter {
             },
           },
           arb,
-          guaranteedPayoutUsd: 0,
+          collateralRequiredUsd: 0,
           grossEdgeUsd: 0,
           totalFeesUsd: 0,
           estimatedSlippageUsd: 0,
-          totalSpendUsd: 0,
+          totalProceedsUsd: 0,
           gasUsd: 0,
           expectedProfitUsd: 0,
           expectedProfitPct: 0,
@@ -181,14 +182,14 @@ export class ArbitrageEngine extends EventEmitter {
 
     this.lastOpportunityAt = now;
 
-    const assessment = await this.riskManager.evaluate(state);
+    const assessment = await this.riskManager.evaluateCeiling(state);
     const opportunityRecord: OpportunityLogRecord = {
       type: "opportunity",
       timestamp: assessment.timestamp,
       marketId: state.market.conditionId,
       slug: state.market.slug,
       question: state.market.question,
-      strategyType: "binary_arb",
+      strategyType: "binary_ceiling",
       direction,
       arb,
       tradeSize: assessment.tradeSize,
@@ -220,7 +221,7 @@ export class ArbitrageEngine extends EventEmitter {
           gasUsd: assessment.gasUsd,
           reason: assessment.reason,
         },
-        "Opportunity rejected by risk manager",
+        "Ceiling opportunity rejected by risk manager",
       );
       return;
     }
@@ -246,7 +247,7 @@ export class ArbitrageEngine extends EventEmitter {
     this.riskManager.markOpportunityTriggered(opportunityKey, now);
     await this.alerts.notifyOpportunity(assessment);
 
-    const result = await this.executionEngine.execute(assessment);
+    const result = await this.executionEngine.executeCeiling(assessment);
     if (result.success) {
       this.opportunitiesExecuted += 1;
     }
@@ -307,10 +308,7 @@ export class ArbitrageEngine extends EventEmitter {
     });
   }
 
-  private buildOpportunityKey(
-    conditionId: string,
-    direction: ArbitrageDirection,
-  ): string {
+  private buildOpportunityKey(conditionId: string, direction: ArbitrageDirection): string {
     return `${conditionId}:${direction}`;
   }
 

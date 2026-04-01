@@ -1,8 +1,10 @@
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import type {
+  CeilingAssessment,
   ExecutionResult,
   LateResolutionAssessment,
+  NegRiskAssessment,
   RiskAssessment,
 } from "./types.js";
 
@@ -12,7 +14,9 @@ export class AlertService {
     private readonly logger: Logger,
   ) {}
 
-  async notifyOpportunity(assessment: RiskAssessment | LateResolutionAssessment): Promise<void> {
+  async notifyOpportunity(
+    assessment: RiskAssessment | CeilingAssessment | LateResolutionAssessment | NegRiskAssessment,
+  ): Promise<void> {
     if (!assessment.viable) {
       return;
     }
@@ -26,6 +30,15 @@ export class AlertService {
           `Size: ${assessment.tradeSize.toFixed(4)}`,
           `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
         ].join("\n")
+      : this.isNegRiskAssessment(assessment)
+        ? [
+            "Polymarket neg-risk opportunity",
+            assessment.groupQuestion,
+            `Source NO: ${assessment.market.question}`,
+            `Targets: ${assessment.targetYesLegs.length}`,
+            `Size: ${assessment.tradeSize.toFixed(4)}`,
+            `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
+          ].join("\n")
       : [
           "Polymarket arb opportunity",
           assessment.market.question,
@@ -105,8 +118,14 @@ export class AlertService {
   }
 
   private isLateResolutionAssessment(
-    assessment: RiskAssessment | LateResolutionAssessment,
+    assessment: RiskAssessment | CeilingAssessment | LateResolutionAssessment | NegRiskAssessment,
   ): assessment is LateResolutionAssessment {
     return "strategyType" in assessment && assessment.strategyType === "late_resolution";
+  }
+
+  private isNegRiskAssessment(
+    assessment: RiskAssessment | CeilingAssessment | LateResolutionAssessment | NegRiskAssessment,
+  ): assessment is NegRiskAssessment {
+    return "strategyType" in assessment && assessment.strategyType === "neg_risk_arb";
   }
 }

@@ -14,8 +14,11 @@ export const calculateNetProfitModel = (
   const grossEdgeUsd = input.tradeSize - input.totalSpendUsd;
   const totalFeesUsd = input.feeLeg1Usd + input.feeLeg2Usd;
 
-  // Model slippage as a haircut on deployed capital, averaged across both legs.
-  const estimatedSlippageUsd = input.totalSpendUsd * input.slippageTolerance;
+  // Prefer the actual sweep cost when the caller provides it, and fall back
+  // to a conservative flat estimate for simpler callers and isolated tests.
+  const estimatedSlippageUsd =
+    input.estimatedSlippageUsd ??
+    (input.totalSpendUsd * input.slippageTolerance);
   const netProfitUsd =
     grossEdgeUsd -
     totalFeesUsd -
