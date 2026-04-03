@@ -69,8 +69,10 @@ npm start
 - `MIN_PROFIT_THRESHOLD=0.005`: minimum post-cost edge after fees, gas, and estimated slippage
 - `MAX_TRADE_SIZE=50`: conservative starter size per leg
 - `MAX_OPEN_NOTIONAL=200`: conservative starter capital cap
+- `MAX_BOOK_AGE_MS=300`: skip binary arb attempts when the local book is older than this
 - `SLIPPAGE_TOLERANCE=0.01`: max sweep beyond top ask when sizing
 - `EXECUTION_ORDER_TYPE=FOK|FAK|GTC`: `FOK` is safest for paired arb; `FAK` allows partials and hedge logic
+- `BINARY_ARB_EXECUTION_MODE=FOK|FAK`: keep `FOK` as the default for the first `us-east` validation run
 - `ENABLE_ORDERBOOK_PERSISTENCE=true`: required if you want local snapshot replay backtests
 - `ENABLE_LATE_RESOLUTION_STRATEGY=true`: enables the second strategy using `LATE_RESOLUTION_SIGNAL_FILE`
 - `LATE_RESOLUTION_SIGNAL_FILE=./data/resolution-signals.ndjson`: local feed of winning-side signals
@@ -102,6 +104,7 @@ This backtest is a replay of recorded book snapshots, not a full matching-engine
 - `FOK` is the recommended default because it minimizes one-leg execution risk.
 - The bot treats arbitrage profit as locked-in only after both legs are filled; otherwise it attempts to flatten imbalance in `FAK` mode.
 - Open notional is tracked locally through the configured cap. Successful filled pairs keep capital reserved because they remain outstanding until manually unwound or resolved.
+- The current validation path is intentionally narrowed to `binary_arb`. Disable `binary_ceiling`, `neg_risk`, and `late_resolution` for the next latency-focused run.
 - Late-resolution trades only run when a matching signal exists in `LATE_RESOLUTION_SIGNAL_FILE`. One JSON object per line is expected, for example:
 
 ```json
@@ -110,6 +113,128 @@ This backtest is a replay of recorded book snapshots, not a full matching-engine
 
 - Fees on Polymarket can be market-dependent. The bot fetches fee-rate bps from CLOB and uses a conservative fee model.
 - Geographical restrictions, exchange rules, and account requirements still apply. This code does not bypass them.
+
+## `us-east` paper validation runbook
+
+The next meaningful validation step is a `48h` paper run from `us-east`, not another long run from Buenos Aires. The goal is to isolate latency and measure whether `binary_arb` becomes fillable when the bot is physically close to the matching engine.
+
+### Recommended target
+
+- Provider: DigitalOcean
+- Region: `nyc3`
+- Image: Ubuntu `24.04`
+- Size: `1 vCPU / 1 GB RAM`
+- Firewall:
+  - allow `22/tcp`
+  - allow `3001/tcp` only from your IP
+
+### Deploy steps
+
+1. SSH into the VPS and install Node.js 22 and git.
+2. Clone the repo into `/opt/polymkt-arb`.
+3. Run `npm ci`.
+4. Create a paper-only env file outside the repo at `/etc/polymkt-arb/polymkt-arb.env`.
+5. Set permissions to `600` and make the same user that runs PM2 own the file.
+6. Export that env before starting PM2, or source it from the shell profile used by PM2.
+7. Run `npm run build`.
+8. Run `npm run pm2:start`.
+
+Example bootstrap:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git curl
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt-get install -y nodejs
+sudo mkdir -p /opt/polymkt-arb /etc/polymkt-arb
+sudo chown "$USER":"$USER" /opt/polymkt-arb
+git clone https://github.com/Mauropestarino/polymkt-arb /opt/polymkt-arb
+cd /opt/polymkt-arb
+npm ci
+sudo install -m 600 /dev/null /etc/polymkt-arb/polymkt-arb.env
+npm run build
+source /etc/polymkt-arb/polymkt-arb.env
+npm run pm2:start
+```
+
+### Exact paper env for the `us-east` run
+
+Keep this run focused on `binary_arb` only:
+
+```env
+BOT_MODE=live
+DRY_RUN=true
+EXECUTION_ORDER_TYPE=FOK
+BINARY_ARB_EXECUTION_MODE=FOK
+MAX_TRADE_SIZE=50
+MAX_OPEN_NOTIONAL=200
+MIN_MARKET_LIQUIDITY=250
+MIN_PROFIT_THRESHOLD=0.005
+MAX_MARKETS=200
+MAX_BOOK_AGE_MS=300
+PAPER_SHADOW_LATENCY_MS=150
+ENABLE_BINARY_CEILING_STRATEGY=false
+ENABLE_NEG_RISK_STRATEGY=false
+ENABLE_LATE_RESOLUTION_STRATEGY=false
+ENABLE_ORDERBOOK_PERSISTENCE=false
+HEALTH_PORT=3001
+LOG_DIR=./data/run-us-east-binary-arb-fok
+PRIVATE_KEY=
+POLY_API_KEY=
+POLY_API_SECRET=
+POLY_API_PASSPHRASE=
+```
+
+### What to watch during the run
+
+- `http://<server-ip>:3001/health`
+- `http://<server-ip>:3001/metrics`
+- `http://<server-ip>:3001/dashboard`
+
+Approval thresholds for the `48h` paper run:
+
+- `shadow_fill_rate >= 15%`
+- `trades_attempted >= 10`
+- `effective shadow PnL > 0`
+- `average opportunity duration >= 1.5s`
+- `open_reservations_count = 0` at the end
+- `ws_disconnect_total <= 2` per `24h`
+- no feed stall longer than `60s`
+
+Decision rules:
+
+- `shadow_fill_rate < 15%`: abandon `binary_arb` as the first live edge
+- `15% <= shadow_fill_rate < 30%`: keep paper mode and open a `FAK + hedge` experiment
+- `shadow_fill_rate >= 30%`: keep `FOK` for the first micro-live
+
+## First micro-live, only if the remote paper run passes
+
+Do not turn on live capital unless the `us-east` paper run passes the thresholds above.
+
+```env
+BOT_MODE=live
+DRY_RUN=false
+EXECUTION_ORDER_TYPE=FOK
+BINARY_ARB_EXECUTION_MODE=FOK
+MAX_TRADE_SIZE=5
+MAX_OPEN_NOTIONAL=25
+MIN_MARKET_LIQUIDITY=250
+MIN_PROFIT_THRESHOLD=0.005
+MAX_MARKETS=200
+MAX_BOOK_AGE_MS=300
+ENABLE_BINARY_CEILING_STRATEGY=false
+ENABLE_NEG_RISK_STRATEGY=false
+ENABLE_LATE_RESOLUTION_STRATEGY=false
+AUTO_MERGE_BINARY_ARB=true
+```
+
+Operational guardrails:
+
+- capital: `$100-150 USDC`
+- duration: `2-4h`
+- one PM2 instance only
+- keep the live key outside the repo and outside the workspace `.env`
+- on DigitalOcean, store the env in `/etc/polymkt-arb/polymkt-arb.env`
 
 ## Output files
 

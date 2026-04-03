@@ -34,6 +34,8 @@ export class ArbitrageEngine extends EventEmitter {
   private totalOpportunityDurationMs = 0;
   private completedOpportunityCount = 0;
   private lastOpportunityAt?: number;
+  private staleBooksSkipped = 0;
+  private lastBookAgeMs?: number;
 
   constructor(
     private readonly config: BotConfig,
@@ -59,6 +61,8 @@ export class ArbitrageEngine extends EventEmitter {
       completedOpportunityCount: this.completedOpportunityCount,
       totalOpportunityDurationMs: this.totalOpportunityDurationMs,
       lastOpportunityAt: this.lastOpportunityAt,
+      staleBooksSkipped: this.staleBooksSkipped,
+      lastBookAgeMs: this.lastBookAgeMs,
     };
   }
 
@@ -238,6 +242,25 @@ export class ArbitrageEngine extends EventEmitter {
       return;
     }
 
+    const bookAgeMs = Math.max(0, now - state.lastUpdatedAt);
+    this.lastBookAgeMs = bookAgeMs;
+    if (bookAgeMs > this.config.maxBookAgeMs) {
+      this.staleBooksSkipped += 1;
+      this.logger.debug(
+        {
+          event: "stale_book_skip",
+          market: state.market.slug,
+          conditionId: state.market.conditionId,
+          bookAgeMs,
+          maxBookAgeMs: this.config.maxBookAgeMs,
+          tradeSize: assessment.tradeSize,
+          expectedProfitUsd: assessment.expectedProfitUsd,
+        },
+        "Skipping binary arb execution because the book is stale",
+      );
+      return;
+    }
+
     if (!activeWindow.attemptedExecution) {
       this.opportunitiesCaptured += 1;
       activeWindow.attemptedExecution = true;
@@ -277,6 +300,11 @@ export class ArbitrageEngine extends EventEmitter {
       reconciliationSatisfied: result.reconciliationSatisfied,
       reconciledPortfolioValueUsd: result.reconciledPortfolioValueUsd,
       reconciledPositionCount: result.reconciledPositionCount,
+      shadowFillSuccess: result.shadowFillSuccess,
+      shadowFillReason: result.shadowFillReason,
+      shadowLatencyMs: result.shadowLatencyMs,
+      shadowRealizedProfitUsd: result.shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd: result.shadowRealizedSlippageUsd,
     });
 
     await this.alerts.notifyTrade(result);

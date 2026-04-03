@@ -232,11 +232,16 @@ const main = async (): Promise<void> => {
         startedAt,
         dryRun: config.dryRun,
         getMarketsTracked: () => scanner.getStats().marketsTracked,
+        getWebsocketDisconnects: () => scanner.getStats().websocketDisconnects,
         getOpenNotionalUsd: () => executionEngine.getStats().openNotionalUsd,
+        getOpenReservationsCount: () => executionEngine.getStats().openReservationsCount,
         getOpportunitiesDetected: getCombinedOpportunitiesDetected,
         getViableOpportunities: getCombinedViableOpportunities,
         getTradesAttempted: () => executionEngine.getStats().executionsAttempted,
         getTradesExecuted: () => executionEngine.getStats().executionsSucceeded,
+        getStaleBooksSkipped: () => arbitrageEngine.getStats().staleBooksSkipped,
+        getLastBookAgeMs: () => arbitrageEngine.getStats().lastBookAgeMs,
+        getShadowFillRate: () => executionEngine.getStats().shadowFillRate,
         getFillRate: () => executionEngine.getStats().fillRate,
         getShareFillRate: () => executionEngine.getStats().shareFillRate,
         getOpportunityCaptureRate: () => {
@@ -250,8 +255,13 @@ const main = async (): Promise<void> => {
         getTradingEnabled: () => tradingGuard.getStatus().tradingEnabled,
         getTradingPauseReason: () => tradingGuard.getStatus().pauseReason,
         getTradingResumeAt: () => tradingGuard.getStatus().resumeAt,
+        getLastRetainedReservationReason: () =>
+          executionEngine.getStats().lastRetainedReservationReason,
+        getLastRetainedReservationAt: () =>
+          executionEngine.getStats().lastRetainedReservationAt,
       },
       logger,
+      () => dashboard.snapshot(),
     );
     dashboard.start(Math.max(config.pollingIntervalMs * 4, 1000));
   } catch (error) {

@@ -670,6 +670,10 @@ export class RiskManager {
         now,
         `Raw neg-risk spread ${roughArb.toFixed(5)} does not clear buffer ${this.config.arbitrageBuffer.toFixed(5)}.`,
         sourceMember.outcomeIndex,
+        {
+          rawSpreadUsd: round(roughArb, 6),
+          convertFeeBps: group.convertFeeBps,
+        },
       );
     }
 
@@ -731,6 +735,7 @@ export class RiskManager {
     }
 
     let bestAssessment: NegRiskAssessment | undefined;
+    let bestRejectedAssessment: NegRiskAssessment | undefined;
 
     for (const candidateSize of candidateSizes.toSorted((left, right) => right - left)) {
       const sourceNoFill = this.estimateBuyFill(allowedNoAsks, candidateSize);
@@ -775,48 +780,12 @@ export class RiskManager {
       const expectedProfitUsd =
         grossEdgeUsd - totalFeesUsd - this.config.gasCostUsd - estimatedSlippageUsd;
       const expectedProfitPct = totalSpendUsd > 0 ? expectedProfitUsd / totalSpendUsd : 0;
+      const requiredProfitUsd = totalSpendUsd * this.config.minProfitThreshold;
+      const thresholdDeltaUsd = expectedProfitUsd - requiredProfitUsd;
 
-      if (expectedProfitUsd <= 0 || expectedProfitPct < this.config.minProfitThreshold) {
-        continue;
-      }
-
-      if (!options?.skipBalanceChecks) {
-        const collateral = await this.wallet.getCollateralStatus();
-        const availableBuffer = this.config.maxOpenNotional - this.getOpenNotionalUsd();
-
-        if (collateral.balance < totalSpendUsd) {
-          return this.buildNegRiskFailure(
-            group,
-            sourceState.market,
-            now,
-            `Insufficient balance. need=${totalSpendUsd.toFixed(4)} balance=${collateral.balance.toFixed(4)}`,
-            sourceMember.outcomeIndex,
-          );
-        }
-
-        if (collateral.allowance < totalSpendUsd) {
-          return this.buildNegRiskFailure(
-            group,
-            sourceState.market,
-            now,
-            `Insufficient allowance. need=${totalSpendUsd.toFixed(4)} allowance=${collateral.allowance.toFixed(4)}`,
-            sourceMember.outcomeIndex,
-          );
-        }
-
-        if (availableBuffer < totalSpendUsd) {
-          return this.buildNegRiskFailure(
-            group,
-            sourceState.market,
-            now,
-            `Open notional cap reached. available=${availableBuffer.toFixed(4)} need=${totalSpendUsd.toFixed(4)}`,
-            sourceMember.outcomeIndex,
-          );
-        }
-      }
-
-      const assessment: NegRiskAssessment = {
-        viable: true,
+      const candidateAssessment: NegRiskAssessment = {
+        viable: false,
+        reason: "No candidate size cleared min profit for neg-risk arb after fees, gas, and slippage.",
         strategyType: "neg_risk_arb",
         market: sourceState.market,
         timestamp: now,
@@ -845,6 +814,65 @@ export class RiskManager {
         expectedProfitUsd: round(expectedProfitUsd, 6),
         expectedProfitPct: round(expectedProfitPct, 6),
         netEdgePerShare: round(expectedProfitUsd / candidateSize, 6),
+        rawSpreadUsd: round(roughArb, 6),
+        sourceNoCostUsd: round(totalSpendUsd, 6),
+        targetYesProceedsUsd: round(totalProceedsUsd, 6),
+        requiredProfitUsd: round(requiredProfitUsd, 6),
+        thresholdDeltaUsd: round(thresholdDeltaUsd, 6),
+      };
+
+      if (expectedProfitUsd <= 0 || expectedProfitPct < this.config.minProfitThreshold) {
+        if (
+          !bestRejectedAssessment ||
+          (candidateAssessment.thresholdDeltaUsd ?? Number.NEGATIVE_INFINITY) >
+            (bestRejectedAssessment.thresholdDeltaUsd ?? Number.NEGATIVE_INFINITY)
+        ) {
+          bestRejectedAssessment = candidateAssessment;
+        }
+        continue;
+      }
+
+      if (!options?.skipBalanceChecks) {
+        const collateral = await this.wallet.getCollateralStatus();
+        const availableBuffer = this.config.maxOpenNotional - this.getOpenNotionalUsd();
+
+        if (collateral.balance < totalSpendUsd) {
+          return this.buildNegRiskFailure(
+            group,
+            sourceState.market,
+            now,
+            `Insufficient balance. need=${totalSpendUsd.toFixed(4)} balance=${collateral.balance.toFixed(4)}`,
+            sourceMember.outcomeIndex,
+            candidateAssessment,
+          );
+        }
+
+        if (collateral.allowance < totalSpendUsd) {
+          return this.buildNegRiskFailure(
+            group,
+            sourceState.market,
+            now,
+            `Insufficient allowance. need=${totalSpendUsd.toFixed(4)} allowance=${collateral.allowance.toFixed(4)}`,
+            sourceMember.outcomeIndex,
+            candidateAssessment,
+          );
+        }
+
+        if (availableBuffer < totalSpendUsd) {
+          return this.buildNegRiskFailure(
+            group,
+            sourceState.market,
+            now,
+            `Open notional cap reached. available=${availableBuffer.toFixed(4)} need=${totalSpendUsd.toFixed(4)}`,
+            sourceMember.outcomeIndex,
+            candidateAssessment,
+          );
+        }
+      }
+      const assessment: NegRiskAssessment = {
+        ...candidateAssessment,
+        viable: true,
+        reason: undefined,
       };
 
       if (!bestAssessment || assessment.expectedProfitUsd > bestAssessment.expectedProfitUsd) {
@@ -854,12 +882,17 @@ export class RiskManager {
 
     return (
       bestAssessment ??
+      bestRejectedAssessment ??
       this.buildNegRiskFailure(
         group,
         sourceState.market,
         now,
         "No candidate size cleared min profit for neg-risk arb after fees, gas, and slippage.",
         sourceMember.outcomeIndex,
+        {
+          rawSpreadUsd: round(roughArb, 6),
+          convertFeeBps: group.convertFeeBps,
+        },
       )
     );
   }
@@ -1213,6 +1246,7 @@ export class RiskManager {
     timestamp: number,
     reason: string,
     sourceOutcomeIndex: number,
+    diagnostics?: Partial<NegRiskAssessment>,
   ): NegRiskAssessment {
     return {
       viable: false,
@@ -1226,19 +1260,19 @@ export class RiskManager {
       groupQuestion: group.title,
       sourceOutcomeIndex,
       negRiskMarketId: group.negRiskMarketId,
-      convertFeeBps: group.convertFeeBps,
-      convertOutputSize: 0,
+      convertFeeBps: diagnostics?.convertFeeBps ?? group.convertFeeBps,
+      convertOutputSize: diagnostics?.convertOutputSize ?? 0,
       sourceNo: {
-        tokenId: market.noTokenId,
-        requestedSize: 0,
-        executableSize: 0,
-        totalCost: 0,
-        averagePrice: 0,
-        worstPrice: 0,
-        slippagePct: 0,
-        levelsConsumed: 0,
-        bestAsk: 0,
-        fee: {
+        tokenId: diagnostics?.sourceNo?.tokenId ?? market.noTokenId,
+        requestedSize: diagnostics?.sourceNo?.requestedSize ?? 0,
+        executableSize: diagnostics?.sourceNo?.executableSize ?? 0,
+        totalCost: diagnostics?.sourceNo?.totalCost ?? 0,
+        averagePrice: diagnostics?.sourceNo?.averagePrice ?? 0,
+        worstPrice: diagnostics?.sourceNo?.worstPrice ?? 0,
+        slippagePct: diagnostics?.sourceNo?.slippagePct ?? 0,
+        levelsConsumed: diagnostics?.sourceNo?.levelsConsumed ?? 0,
+        bestAsk: diagnostics?.sourceNo?.bestAsk ?? 0,
+        fee: diagnostics?.sourceNo?.fee ?? {
           feeRateBps: 0,
           feeRate: 0,
           feeExponent: 1,
@@ -1246,17 +1280,22 @@ export class RiskManager {
           feeShares: 0,
         },
       },
-      targetYesLegs: [],
-      arb: 0,
-      grossEdgeUsd: 0,
-      totalFeesUsd: 0,
-      estimatedSlippageUsd: 0,
-      totalSpendUsd: 0,
-      totalProceedsUsd: 0,
+      targetYesLegs: diagnostics?.targetYesLegs ?? [],
+      arb: diagnostics?.arb ?? diagnostics?.rawSpreadUsd ?? 0,
+      grossEdgeUsd: diagnostics?.grossEdgeUsd ?? 0,
+      totalFeesUsd: diagnostics?.totalFeesUsd ?? 0,
+      estimatedSlippageUsd: diagnostics?.estimatedSlippageUsd ?? 0,
+      totalSpendUsd: diagnostics?.totalSpendUsd ?? diagnostics?.sourceNoCostUsd ?? 0,
+      totalProceedsUsd: diagnostics?.totalProceedsUsd ?? diagnostics?.targetYesProceedsUsd ?? 0,
       gasUsd: this.config.gasCostUsd,
-      expectedProfitUsd: 0,
-      expectedProfitPct: 0,
-      netEdgePerShare: 0,
+      expectedProfitUsd: diagnostics?.expectedProfitUsd ?? 0,
+      expectedProfitPct: diagnostics?.expectedProfitPct ?? 0,
+      netEdgePerShare: diagnostics?.netEdgePerShare ?? 0,
+      rawSpreadUsd: diagnostics?.rawSpreadUsd,
+      sourceNoCostUsd: diagnostics?.sourceNoCostUsd,
+      targetYesProceedsUsd: diagnostics?.targetYesProceedsUsd,
+      requiredProfitUsd: diagnostics?.requiredProfitUsd,
+      thresholdDeltaUsd: diagnostics?.thresholdDeltaUsd,
     };
   }
 }

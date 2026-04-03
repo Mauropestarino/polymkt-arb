@@ -59,6 +59,8 @@ export class CeilingArbitrageEngine extends EventEmitter {
       completedOpportunityCount: this.completedOpportunityCount,
       totalOpportunityDurationMs: this.totalOpportunityDurationMs,
       lastOpportunityAt: this.lastOpportunityAt,
+      staleBooksSkipped: 0,
+      lastBookAgeMs: undefined,
     };
   }
 
@@ -278,6 +280,11 @@ export class CeilingArbitrageEngine extends EventEmitter {
       reconciliationSatisfied: result.reconciliationSatisfied,
       reconciledPortfolioValueUsd: result.reconciledPortfolioValueUsd,
       reconciledPositionCount: result.reconciledPositionCount,
+      shadowFillSuccess: result.shadowFillSuccess,
+      shadowFillReason: result.shadowFillReason,
+      shadowLatencyMs: result.shadowLatencyMs,
+      shadowRealizedProfitUsd: result.shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd: result.shadowRealizedSlippageUsd,
     });
 
     await this.alerts.notifyTrade(result);

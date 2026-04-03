@@ -8,11 +8,13 @@ import type {
   ExecutionResult,
   ExecutionStats,
   LateResolutionAssessment,
+  MarketBookState,
   NegRiskAssessment,
   OrderStatusSnapshot,
   PortfolioReconciliationResult,
   RiskAssessment,
   SettlementReceipt,
+  TokenBookState,
 } from "./types.js";
 import { round, sum, stableId, sleep, toTickSize } from "./lib/utils.js";
 import { OrderBookStore } from "./orderBookStore.js";
@@ -77,6 +79,23 @@ type BasketReconciliation = {
   fullyFlat: boolean;
 };
 
+type ReservationAuditEntry = {
+  reservationId: string;
+  strategyType: ExecutionResult["strategyType"];
+  scopeKey: string;
+  notionalUsd: number;
+  reservedAt: number;
+};
+
+type ShadowOrderEvaluation = {
+  full: boolean;
+  executableSize: number;
+  totalValueUsd: number;
+  averagePrice: number;
+  realizedSlippageUsd: number;
+  reason?: string;
+};
+
 interface ExecutionEngineDependencies {
   ctfSettlement?: CtfSettlementService;
   portfolioReconciler?: PortfolioReconciler;
@@ -91,7 +110,12 @@ export class ExecutionEngine {
   private intendedShares = 0;
   private estimatedSlippageUsdTotal = 0;
   private realizedSlippageUsdTotal = 0;
+  private shadowExecutionsAttempted = 0;
+  private shadowExecutionsFilled = 0;
   private readonly marketLocks = new Set<string>();
+  private readonly reservationAudit = new Map<string, ReservationAuditEntry>();
+  private lastRetainedReservationReason?: string;
+  private lastRetainedReservationAt?: number;
 
   constructor(
     private readonly config: BotConfig,
@@ -107,10 +131,105 @@ export class ExecutionEngine {
     return this.marketLocks.has(conditionId);
   }
 
+  private reserveExposure(
+    reservationId: string,
+    strategyType: ExecutionResult["strategyType"],
+    scopeKey: string,
+    notionalUsd: number,
+  ): boolean {
+    const accepted = this.riskManager.reserve(reservationId, notionalUsd);
+    if (!accepted) {
+      return false;
+    }
+
+    const entry: ReservationAuditEntry = {
+      reservationId,
+      strategyType,
+      scopeKey,
+      notionalUsd: round(notionalUsd, 6),
+      reservedAt: Date.now(),
+    };
+    this.reservationAudit.set(reservationId, entry);
+    this.logger.info(
+      {
+        event: "reservation_reserved",
+        strategy: strategyType,
+        key: scopeKey,
+        notionalUsd: entry.notionalUsd,
+        timestamp: entry.reservedAt,
+      },
+      "Reserved execution notional",
+    );
+    return true;
+  }
+
+  private releaseExposure(reservationId: string, reason: string): void {
+    const entry = this.reservationAudit.get(reservationId);
+    this.riskManager.release(reservationId);
+    if (entry) {
+      this.reservationAudit.delete(reservationId);
+    }
+
+    this.logger.info(
+      {
+        event: "reservation_released",
+        strategy: entry?.strategyType,
+        key: entry?.scopeKey ?? reservationId,
+        notionalUsd: entry?.notionalUsd,
+        timestamp: Date.now(),
+        reason,
+      },
+      "Released reserved execution notional",
+    );
+  }
+
+  private retainReservation(reservationId: string, reason: string): void {
+    const entry = this.reservationAudit.get(reservationId);
+    this.lastRetainedReservationReason = reason;
+    this.lastRetainedReservationAt = Date.now();
+    this.logger.warn(
+      {
+        event: "reservation_retained",
+        strategy: entry?.strategyType,
+        key: entry?.scopeKey ?? reservationId,
+        notionalUsd: entry?.notionalUsd,
+        timestamp: this.lastRetainedReservationAt,
+        reason,
+      },
+      "Retained reservation due to unresolved exposure",
+    );
+  }
+
+  private logHedgeEvent(
+    strategyType: ExecutionResult["strategyType"],
+    scopeKey: string,
+    notionalUsd: number,
+    reason: string,
+    hedged: boolean,
+  ): void {
+    const timestamp = Date.now();
+    this.logger[hedged ? "warn" : "error"](
+      {
+        event: "reservation_hedge",
+        strategy: strategyType,
+        key: scopeKey,
+        notionalUsd: round(notionalUsd, 6),
+        timestamp,
+        reason,
+        hedged,
+      },
+      hedged ? "Triggered hedge for residual exposure" : "Residual exposure hedge failed",
+    );
+  }
+
   getStats(): ExecutionStats {
     const fillRate =
       this.executionsAttempted > 0 ? this.executionsSucceeded / this.executionsAttempted : 0;
     const shareFillRate = this.intendedShares > 0 ? this.filledShares / this.intendedShares : 0;
+    const shadowFillRate =
+      this.shadowExecutionsAttempted > 0
+        ? this.shadowExecutionsFilled / this.shadowExecutionsAttempted
+        : 0;
     const estimatedSlippageUsdAverage =
       this.executionsAttempted > 0 ? this.estimatedSlippageUsdTotal / this.executionsAttempted : 0;
     const realizedSlippageUsdAverage =
@@ -122,6 +241,10 @@ export class ExecutionEngine {
       executionsFailed: this.executionsFailed,
       hedgesTriggered: this.hedgesTriggered,
       openNotionalUsd: this.riskManager.getOpenNotionalUsd(),
+      openReservationsCount: this.reservationAudit.size,
+      shadowExecutionsAttempted: this.shadowExecutionsAttempted,
+      shadowExecutionsFilled: this.shadowExecutionsFilled,
+      shadowFillRate: round(shadowFillRate, 6),
       filledShares: round(this.filledShares, 6),
       intendedShares: round(this.intendedShares, 6),
       fillRate: round(fillRate, 6),
@@ -130,7 +253,13 @@ export class ExecutionEngine {
       estimatedSlippageUsdAverage: round(estimatedSlippageUsdAverage, 6),
       realizedSlippageUsdTotal: round(this.realizedSlippageUsdTotal, 6),
       realizedSlippageUsdAverage: round(realizedSlippageUsdAverage, 6),
+      lastRetainedReservationReason: this.lastRetainedReservationReason,
+      lastRetainedReservationAt: this.lastRetainedReservationAt,
     };
+  }
+
+  private getBinaryArbOrderType(): OrderType {
+    return orderTypeMap[this.config.binaryArbExecutionMode];
   }
 
   async execute(assessment: RiskAssessment, modeOverride?: ExecutionMode): Promise<ExecutionResult> {
@@ -156,7 +285,14 @@ export class ExecutionEngine {
     this.recordAttempt(intendedShares, assessment.estimatedSlippageUsd);
     this.marketLocks.add(assessment.market.conditionId);
 
-    if (!this.riskManager.reserve(reservationId, assessment.totalSpendUsd)) {
+    if (
+      !this.reserveExposure(
+        reservationId,
+        "binary_arb",
+        assessment.market.conditionId,
+        assessment.totalSpendUsd,
+      )
+    ) {
       this.marketLocks.delete(assessment.market.conditionId);
       this.executionsFailed += 1;
       return {
@@ -181,28 +317,11 @@ export class ExecutionEngine {
 
     try {
       if (modeOverride === "backtest" || this.config.dryRun) {
-        this.executionsSucceeded += 1;
-        this.recordFill(intendedShares, 0);
-        return {
-          mode: modeOverride ?? "paper",
-          success: true,
-          strategyType: "binary_arb",
-          market: assessment.market,
-          timestamp: Date.now(),
-          tradeSize: assessment.tradeSize,
-          expectedProfitUsd: assessment.expectedProfitUsd,
-          realizedProfitUsd: assessment.expectedProfitUsd,
-          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
-          realizedSlippageUsd: 0,
-          orderIds: [],
-          hedgeOrderIds: [],
-          hedged: false,
-          notes: ["Paper execution only; no order was posted."],
-        };
+        return this.executePaperBinaryArb(assessment, reservationId, intendedShares, modeOverride);
       }
 
       const client = this.wallet.requireTradingClient();
-      const orderType = orderTypeMap[this.config.executionOrderType];
+        const orderType = this.getBinaryArbOrderType();
       const negRisk = assessment.market.negRisk ?? false;
       const yesTickSize = this.resolveTickSize(
         assessment.market.conditionId,
@@ -268,6 +387,10 @@ export class ExecutionEngine {
       this.executionsFailed += 1;
       const notes = [...reconciliation.notes];
       if (!reconciliation.fullyFlat) {
+        this.retainReservation(
+          reservationId,
+          "Binary execution did not fully flatten both live legs.",
+        );
         notes.push("Reservation retained due to partial live exposure.");
       }
 
@@ -315,9 +438,16 @@ export class ExecutionEngine {
             this.executionsFailed += 1;
             notes.push(...reconciliation.notes);
             if (reconciliation.fullyFlat) {
-              this.riskManager.release(reservationId);
+              this.releaseExposure(
+                reservationId,
+                "Post-error reconciliation confirmed no residual exposure.",
+              );
               notes.push("Post-error reconciliation confirmed no residual exposure; reservation released.");
             } else {
+              this.retainReservation(
+                reservationId,
+                "Post-error reconciliation found possible live binary exposure.",
+              );
               notes.push("Reservation retained after post-error reconciliation due to possible live exposure.");
             }
             return {
@@ -345,14 +475,22 @@ export class ExecutionEngine {
                 ? `Post-error reconciliation failed: ${reconciliationError.message}`
                 : "Post-error reconciliation failed.",
             );
+            this.retainReservation(
+              reservationId,
+              "Post-error binary reconciliation failed after order submission.",
+            );
             notes.push("Reservation retained until manual reconciliation confirms no live exposure.");
           }
         } else {
+          this.retainReservation(
+            reservationId,
+            "Binary order submission crossed the exchange boundary without recoverable order IDs.",
+          );
           notes.push("Order submission crossed the exchange boundary before failing; reservation retained.");
           notes.push("Manual reconciliation is required because no order IDs were returned.");
         }
       } else {
-        this.riskManager.release(reservationId);
+        this.releaseExposure(reservationId, "Binary execution failed before any live order was posted.");
       }
 
       this.executionsFailed += 1;
@@ -403,7 +541,14 @@ export class ExecutionEngine {
     this.recordAttempt(intendedShares, assessment.estimatedSlippageUsd);
     this.marketLocks.add(assessment.market.conditionId);
 
-    if (!this.riskManager.reserve(reservationId, assessment.collateralRequiredUsd)) {
+    if (
+      !this.reserveExposure(
+        reservationId,
+        "binary_ceiling",
+        assessment.market.conditionId,
+        assessment.collateralRequiredUsd,
+      )
+    ) {
       this.marketLocks.delete(assessment.market.conditionId);
       this.executionsFailed += 1;
       return {
@@ -429,29 +574,12 @@ export class ExecutionEngine {
 
     try {
       if (modeOverride === "backtest" || this.config.dryRun) {
-        this.executionsSucceeded += 1;
-        this.recordFill(intendedShares, 0);
-        return {
-          mode: modeOverride ?? "paper",
-          success: true,
-          strategyType: "binary_ceiling",
-          market: assessment.market,
-          timestamp: Date.now(),
-          tradeSize: assessment.tradeSize,
-          expectedProfitUsd: assessment.expectedProfitUsd,
-          realizedProfitUsd: assessment.expectedProfitUsd,
-          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
-          realizedSlippageUsd: 0,
-          orderIds: [],
-          hedgeOrderIds: [],
-          hedged: false,
-          notes: ["Paper execution only; no split or orders were posted."],
-        };
+        return this.executePaperCeiling(assessment, reservationId, intendedShares, modeOverride);
       }
 
       splitReceipt = await this.performCeilingSplit(assessment);
       const client = this.wallet.requireTradingClient();
-      const orderType = orderTypeMap[this.config.executionOrderType];
+        const orderType = orderTypeMap[this.config.executionOrderType];
       const negRisk = assessment.market.negRisk ?? false;
       const yesTickSize = this.resolveTickSize(
         assessment.market.conditionId,
@@ -515,6 +643,10 @@ export class ExecutionEngine {
       }
 
       this.executionsFailed += 1;
+      this.retainReservation(
+        reservationId,
+        "Ceiling execution did not fully flatten the split inventory.",
+      );
       return {
         mode: "live",
         success: false,
@@ -576,6 +708,10 @@ export class ExecutionEngine {
 
             this.executionsFailed += 1;
             notes.push(...reconciliation.notes);
+            this.retainReservation(
+              reservationId,
+              "Post-error reconciliation found possible live ceiling inventory.",
+            );
             notes.push("Reservation retained after post-error reconciliation due to possible live inventory.");
             return {
               mode: "live",
@@ -606,16 +742,28 @@ export class ExecutionEngine {
                 ? `Post-error reconciliation failed: ${reconciliationError.message}`
                 : "Post-error reconciliation failed.",
             );
+            this.retainReservation(
+              reservationId,
+              "Post-error ceiling reconciliation failed after split/order submission.",
+            );
             notes.push("Reservation retained until manual reconciliation confirms the split inventory is flat.");
           }
         } else {
+          this.retainReservation(
+            reservationId,
+            "Ceiling order submission crossed the exchange boundary without recoverable order IDs.",
+          );
           notes.push("Order submission crossed the exchange boundary before failing; reservation retained.");
           notes.push("Manual reconciliation is required because no order IDs were returned.");
         }
       } else if (splitReceipt) {
+        this.retainReservation(
+          reservationId,
+          "Ceiling split succeeded before order submission failed.",
+        );
         notes.push("Split succeeded before order submission failed; reservation retained for the paired inventory.");
       } else {
-        this.riskManager.release(reservationId);
+        this.releaseExposure(reservationId, "Ceiling execution failed before split or live order placement.");
       }
 
       this.executionsFailed += 1;
@@ -678,7 +826,14 @@ export class ExecutionEngine {
     this.recordAttempt(intendedShares, assessment.estimatedSlippageUsd);
     this.marketLocks.add(assessment.groupId);
 
-    if (!this.riskManager.reserve(reservationId, assessment.totalSpendUsd)) {
+    if (
+      !this.reserveExposure(
+        reservationId,
+        "neg_risk_arb",
+        assessment.groupId,
+        assessment.totalSpendUsd,
+      )
+    ) {
       this.marketLocks.delete(assessment.groupId);
       this.executionsFailed += 1;
       return {
@@ -710,27 +865,7 @@ export class ExecutionEngine {
 
     try {
       if (modeOverride === "backtest" || this.config.dryRun) {
-        this.executionsSucceeded += 1;
-        this.recordFill(intendedShares, 0);
-        return {
-          mode: modeOverride ?? "paper",
-          success: true,
-          strategyType: "neg_risk_arb",
-          market: assessment.market,
-          groupId: assessment.groupId,
-          groupSlug: assessment.groupSlug,
-          groupQuestion: assessment.groupQuestion,
-          timestamp: Date.now(),
-          tradeSize: assessment.tradeSize,
-          expectedProfitUsd: assessment.expectedProfitUsd,
-          realizedProfitUsd: assessment.expectedProfitUsd,
-          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
-          realizedSlippageUsd: 0,
-          orderIds: [],
-          hedgeOrderIds: [],
-          hedged: false,
-          notes: ["Paper execution only; no neg-risk orders were posted."],
-        };
+        return this.executePaperNegRisk(assessment, reservationId, intendedShares, modeOverride);
       }
 
       const settlement = this.dependencies.ctfSettlement;
@@ -743,7 +878,7 @@ export class ExecutionEngine {
       }
 
       const client = this.wallet.requireTradingClient();
-      const orderType = orderTypeMap[this.config.executionOrderType];
+        const orderType = orderTypeMap[this.config.executionOrderType];
       const sourceTickSize = this.resolveTickSize(
         assessment.market.conditionId,
         assessment.sourceNo.tokenId,
@@ -858,6 +993,10 @@ export class ExecutionEngine {
       }
 
       this.executionsFailed += 1;
+      this.retainReservation(
+        reservationId,
+        "Neg-risk basket did not fully flatten converted YES inventory.",
+      );
       return {
         mode: "live",
         success: false,
@@ -924,14 +1063,19 @@ export class ExecutionEngine {
               assessment.sourceNo.tokenId,
               sourceReconciliation.snapshot.matchedSize,
               "source NO",
+              "neg_risk_arb",
+              assessment.groupId,
             );
             notes.push(...unwind.notes);
             if (unwind.hedged && !sourceReconciliation.hasOpenOrders) {
-              this.riskManager.release(reservationId);
+              this.releaseExposure(reservationId, "Reservation released after source NO unwind.");
               notes.push("Reservation released after source NO unwind.");
             }
           } else if (sourceReconciliation.fullyFlat) {
-            this.riskManager.release(reservationId);
+            this.releaseExposure(
+              reservationId,
+              "Failed neg-risk source order left no residual exposure.",
+            );
             notes.push("Reservation released after failed neg-risk source order left no exposure.");
           }
         } catch (reconciliationError) {
@@ -939,6 +1083,10 @@ export class ExecutionEngine {
             reconciliationError instanceof Error
               ? `Post-error source reconciliation failed: ${reconciliationError.message}`
               : "Post-error source reconciliation failed.",
+          );
+          this.retainReservation(
+            reservationId,
+            "Post-error neg-risk source reconciliation failed.",
           );
           notes.push("Reservation retained until manual reconciliation confirms no live exposure.");
         }
@@ -988,6 +1136,10 @@ export class ExecutionEngine {
             reconciliationError instanceof Error
               ? `Post-error basket reconciliation failed: ${reconciliationError.message}`
               : "Post-error basket reconciliation failed.",
+          );
+          this.retainReservation(
+            reservationId,
+            "Post-error neg-risk basket reconciliation failed after conversion.",
           );
         }
       }
@@ -1052,7 +1204,14 @@ export class ExecutionEngine {
     this.recordAttempt(intendedShares, assessment.estimatedSlippageUsd);
     this.marketLocks.add(assessment.market.conditionId);
 
-    if (!this.riskManager.reserve(reservationId, assessment.totalSpendUsd)) {
+    if (
+      !this.reserveExposure(
+        reservationId,
+        "late_resolution",
+        assessment.market.conditionId,
+        assessment.totalSpendUsd,
+      )
+    ) {
       this.marketLocks.delete(assessment.market.conditionId);
       this.executionsFailed += 1;
       return {
@@ -1078,29 +1237,11 @@ export class ExecutionEngine {
 
     try {
       if (modeOverride === "backtest" || this.config.dryRun) {
-        this.executionsSucceeded += 1;
-        this.recordFill(intendedShares, 0);
-        return {
-          mode: modeOverride ?? "paper",
-          success: true,
-          strategyType: "late_resolution",
-          market: assessment.market,
-          timestamp: Date.now(),
-          tradeSize: assessment.tradeSize,
-          expectedProfitUsd: assessment.expectedProfitUsd,
-          realizedProfitUsd: assessment.expectedProfitUsd,
-          estimatedSlippageUsd: assessment.estimatedSlippageUsd,
-          realizedSlippageUsd: 0,
-          orderIds: [],
-          hedgeOrderIds: [],
-          hedged: false,
-          resolvedOutcome: assessment.resolvedOutcome,
-          notes: ["Paper execution only; no order was posted."],
-        };
+        return this.executePaperLateResolution(assessment, reservationId, intendedShares, modeOverride);
       }
 
       const client = this.wallet.requireTradingClient();
-      const orderType = orderTypeMap[this.config.executionOrderType];
+        const orderType = orderTypeMap[this.config.executionOrderType];
       const negRisk = assessment.market.negRisk ?? false;
       const tickSize = this.resolveTickSize(
         assessment.market.conditionId,
@@ -1146,7 +1287,10 @@ export class ExecutionEngine {
       this.executionsFailed += 1;
       const notes = [...reconciliation.notes];
       if (reconciliation.fullyFlat) {
-        this.riskManager.release(reservationId);
+        this.releaseExposure(
+          reservationId,
+          "Late-resolution live reconciliation confirmed no residual exposure.",
+        );
         notes.push("Live reconciliation confirmed no residual exposure; reservation released.");
       }
       return {
@@ -1165,7 +1309,13 @@ export class ExecutionEngine {
         resolvedOutcome: assessment.resolvedOutcome,
         notes: reconciliation.fullyFlat
           ? [...notes, "Late-resolution order did not fully fill."]
-          : [...notes, "Late-resolution order partially filled; reservation retained for open exposure."],
+          : (() => {
+              this.retainReservation(
+                reservationId,
+                "Late-resolution order partially filled and may still hold live exposure.",
+              );
+              return [...notes, "Late-resolution order partially filled; reservation retained for open exposure."];
+            })(),
       };
     } catch (error) {
       this.tradingGuard.handleError(error, "late_resolution_execute");
@@ -1211,9 +1361,16 @@ export class ExecutionEngine {
             this.executionsFailed += 1;
             notes.push(...reconciliation.notes);
             if (reconciliation.fullyFlat) {
-              this.riskManager.release(reservationId);
+              this.releaseExposure(
+                reservationId,
+                "Post-error late-resolution reconciliation confirmed no residual exposure.",
+              );
               notes.push("Post-error reconciliation confirmed no residual exposure; reservation released.");
             } else {
+              this.retainReservation(
+                reservationId,
+                "Post-error late-resolution reconciliation found possible live exposure.",
+              );
               notes.push("Reservation retained after post-error reconciliation due to possible live exposure.");
             }
             return {
@@ -1242,14 +1399,25 @@ export class ExecutionEngine {
                 ? `Post-error reconciliation failed: ${reconciliationError.message}`
                 : "Post-error reconciliation failed.",
             );
+            this.retainReservation(
+              reservationId,
+              "Post-error late-resolution reconciliation failed after order submission.",
+            );
             notes.push("Reservation retained until manual reconciliation confirms no live exposure.");
           }
         } else {
+          this.retainReservation(
+            reservationId,
+            "Late-resolution order submission crossed the exchange boundary without order IDs.",
+          );
           notes.push("Order submission crossed the exchange boundary before failing; reservation retained.");
           notes.push("Manual reconciliation is required because no order IDs were returned.");
         }
       } else {
-        this.riskManager.release(reservationId);
+        this.releaseExposure(
+          reservationId,
+          "Late-resolution execution failed before any live order was posted.",
+        );
       }
 
       this.executionsFailed += 1;
@@ -1546,6 +1714,8 @@ export class ExecutionEngine {
             entry.order!.tokenId,
             entry.remainingSize,
             `converted YES leg ${entry.order!.tokenId}`,
+            "neg_risk_arb",
+            assessment.groupId,
           ),
         ),
       );
@@ -1649,6 +1819,545 @@ export class ExecutionEngine {
     }
   }
 
+  private getTokenBookState(
+    conditionId: string,
+    tokenId: string,
+  ): { marketState?: MarketBookState; tokenBook?: TokenBookState } {
+    const marketState = this.store.getMarket(conditionId);
+    if (!marketState) {
+      return {};
+    }
+
+    if (marketState.yes.tokenId === tokenId) {
+      return { marketState, tokenBook: marketState.yes };
+    }
+
+    if (marketState.no.tokenId === tokenId) {
+      return { marketState, tokenBook: marketState.no };
+    }
+
+    return { marketState };
+  }
+
+  private evaluateShadowOrder(
+    conditionId: string,
+    tokenId: string,
+    side: "BUY" | "SELL",
+    requestedSize: number,
+    worstPrice: number,
+    expectedAveragePrice: number,
+  ): ShadowOrderEvaluation {
+    const { tokenBook } = this.getTokenBookState(conditionId, tokenId);
+    if (!tokenBook) {
+      return {
+        full: false,
+        executableSize: 0,
+        totalValueUsd: 0,
+        averagePrice: 0,
+        realizedSlippageUsd: 0,
+        reason: `Token ${tokenId} is no longer available in the in-memory order book.`,
+      };
+    }
+
+    const levels =
+      side === "BUY"
+        ? tokenBook.asks.filter((level) => level.price <= worstPrice + EXECUTION_EPSILON)
+        : tokenBook.bids.filter((level) => level.price >= worstPrice - EXECUTION_EPSILON);
+
+    if (levels.length === 0) {
+      return {
+        full: false,
+        executableSize: 0,
+        totalValueUsd: 0,
+        averagePrice: 0,
+        realizedSlippageUsd: 0,
+        reason: `No ${side === "BUY" ? "asks" : "bids"} remained inside the shadow limit price.`,
+      };
+    }
+
+    let remaining = requestedSize;
+    let totalValueUsd = 0;
+    let executableSize = 0;
+
+    for (const level of levels) {
+      if (remaining <= EXECUTION_EPSILON) {
+        break;
+      }
+
+      const size = Math.min(level.size, remaining);
+      executableSize += size;
+      totalValueUsd += size * level.price;
+      remaining -= size;
+    }
+
+    if (executableSize <= EXECUTION_EPSILON) {
+      return {
+        full: false,
+        executableSize: 0,
+        totalValueUsd: 0,
+        averagePrice: 0,
+        realizedSlippageUsd: 0,
+        reason: `Shadow re-check found zero executable size for token ${tokenId}.`,
+      };
+    }
+
+    const averagePrice = totalValueUsd / executableSize;
+    const realizedSlippageUsd =
+      side === "BUY"
+        ? (averagePrice - expectedAveragePrice) * executableSize
+        : (expectedAveragePrice - averagePrice) * executableSize;
+
+    if (executableSize + EXECUTION_EPSILON < requestedSize) {
+      return {
+        full: false,
+        executableSize: round(executableSize, 6),
+        totalValueUsd: round(totalValueUsd, 6),
+        averagePrice: round(averagePrice, 6),
+        realizedSlippageUsd: round(Math.max(0, realizedSlippageUsd), 6),
+        reason: `Shadow fill only found ${executableSize.toFixed(4)} / ${requestedSize.toFixed(4)} shares inside the limit.`,
+      };
+    }
+
+    return {
+      full: true,
+      executableSize: round(executableSize, 6),
+      totalValueUsd: round(totalValueUsd, 6),
+      averagePrice: round(averagePrice, 6),
+      realizedSlippageUsd: round(Math.max(0, realizedSlippageUsd), 6),
+    };
+  }
+
+  private estimateShadowFeeUsd(
+    executedSize: number,
+    averagePrice: number,
+    feeRateBps: number,
+  ): number {
+    if (executedSize <= 0 || averagePrice <= 0 || feeRateBps <= 0) {
+      return 0;
+    }
+
+    return round(executedSize * (feeRateBps / 10_000) * averagePrice * (1 - averagePrice), 6);
+  }
+
+  private buildPaperFailureResult(
+    strategyType: ExecutionResult["strategyType"],
+    market: ExecutionResult["market"],
+    tradeSize: number,
+    expectedProfitUsd: number,
+    estimatedSlippageUsd: number | undefined,
+    reservationId: string,
+    shadowLatencyMs: number,
+    shadowFillReason: string,
+    modeOverride?: ExecutionMode,
+    extras?: Partial<ExecutionResult>,
+  ): ExecutionResult {
+    this.executionsFailed += 1;
+    this.releaseExposure(reservationId, `Paper shadow fill failed: ${shadowFillReason}`);
+    return {
+      mode: modeOverride ?? "paper",
+      success: false,
+      strategyType,
+      market,
+      timestamp: Date.now(),
+      tradeSize,
+      expectedProfitUsd,
+      estimatedSlippageUsd,
+      orderIds: [],
+      hedgeOrderIds: [],
+      hedged: false,
+      notes: [
+        `Paper shadow fill failed after ${shadowLatencyMs}ms.`,
+        shadowFillReason,
+        "No order was posted to the exchange.",
+      ],
+      shadowFillSuccess: false,
+      shadowFillReason,
+      shadowLatencyMs,
+      shadowRealizedSlippageUsd: 0,
+      ...extras,
+    };
+  }
+
+  private async executePaperBinaryArb(
+    assessment: RiskAssessment,
+    reservationId: string,
+    intendedShares: number,
+    modeOverride?: ExecutionMode,
+  ): Promise<ExecutionResult> {
+    const shadowLatencyMs = this.config.paperShadowLatencyMs;
+    this.shadowExecutionsAttempted += 1;
+    await sleep(shadowLatencyMs);
+
+    const yesFill = this.evaluateShadowOrder(
+      assessment.market.conditionId,
+      assessment.market.yesTokenId,
+      "BUY",
+      assessment.tradeSize,
+      assessment.yes.worstPrice,
+      assessment.yes.averagePrice,
+    );
+    const noFill = this.evaluateShadowOrder(
+      assessment.market.conditionId,
+      assessment.market.noTokenId,
+      "BUY",
+      assessment.tradeSize,
+      assessment.no.worstPrice,
+      assessment.no.averagePrice,
+    );
+
+    if (!yesFill.full || !noFill.full) {
+      return this.buildPaperFailureResult(
+        "binary_arb",
+        assessment.market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        reservationId,
+        shadowLatencyMs,
+        yesFill.reason ?? noFill.reason ?? "Shadow binary fill could not complete both legs.",
+        modeOverride,
+      );
+    }
+
+    const totalSpendUsd = yesFill.totalValueUsd + noFill.totalValueUsd;
+    const totalFeesUsd =
+      this.estimateShadowFeeUsd(yesFill.executableSize, yesFill.averagePrice, assessment.yes.fee.feeRateBps) +
+      this.estimateShadowFeeUsd(noFill.executableSize, noFill.averagePrice, assessment.no.fee.feeRateBps);
+    const shadowRealizedSlippageUsd = round(
+      yesFill.realizedSlippageUsd + noFill.realizedSlippageUsd,
+      6,
+    );
+    const shadowRealizedProfitUsd = round(
+      assessment.tradeSize - totalSpendUsd - totalFeesUsd - assessment.gasUsd,
+      6,
+    );
+
+    this.executionsSucceeded += 1;
+    this.shadowExecutionsFilled += 1;
+    this.recordFill(intendedShares, shadowRealizedSlippageUsd);
+    this.releaseExposure(
+      reservationId,
+      "Paper shadow fill completed without opening live exposure.",
+    );
+
+    return {
+      mode: modeOverride ?? "paper",
+      success: true,
+      strategyType: "binary_arb",
+      market: assessment.market,
+      timestamp: Date.now(),
+      tradeSize: assessment.tradeSize,
+      expectedProfitUsd: assessment.expectedProfitUsd,
+      estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      orderIds: [],
+      hedgeOrderIds: [],
+      hedged: false,
+      notes: [
+        `Paper shadow fill confirmed after ${shadowLatencyMs}ms.`,
+        "No order was posted to the exchange.",
+      ],
+      shadowFillSuccess: true,
+      shadowFillReason: "Both legs remained fully executable inside the configured FOK limits.",
+      shadowLatencyMs,
+      shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd,
+    };
+  }
+
+  private async executePaperCeiling(
+    assessment: CeilingAssessment,
+    reservationId: string,
+    intendedShares: number,
+    modeOverride?: ExecutionMode,
+  ): Promise<ExecutionResult> {
+    const shadowLatencyMs = this.config.paperShadowLatencyMs;
+    this.shadowExecutionsAttempted += 1;
+    await sleep(shadowLatencyMs);
+
+    const yesFill = this.evaluateShadowOrder(
+      assessment.market.conditionId,
+      assessment.market.yesTokenId,
+      "SELL",
+      assessment.tradeSize,
+      assessment.yes.worstPrice,
+      assessment.yes.averagePrice,
+    );
+    const noFill = this.evaluateShadowOrder(
+      assessment.market.conditionId,
+      assessment.market.noTokenId,
+      "SELL",
+      assessment.tradeSize,
+      assessment.no.worstPrice,
+      assessment.no.averagePrice,
+    );
+
+    if (!yesFill.full || !noFill.full) {
+      return this.buildPaperFailureResult(
+        "binary_ceiling",
+        assessment.market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        reservationId,
+        shadowLatencyMs,
+        yesFill.reason ?? noFill.reason ?? "Shadow ceiling fill could not complete both sell legs.",
+        modeOverride,
+      );
+    }
+
+    const totalProceedsUsd = yesFill.totalValueUsd + noFill.totalValueUsd;
+    const totalFeesUsd =
+      this.estimateShadowFeeUsd(yesFill.executableSize, yesFill.averagePrice, assessment.yes.fee.feeRateBps) +
+      this.estimateShadowFeeUsd(noFill.executableSize, noFill.averagePrice, assessment.no.fee.feeRateBps);
+    const shadowRealizedSlippageUsd = round(
+      yesFill.realizedSlippageUsd + noFill.realizedSlippageUsd,
+      6,
+    );
+    const shadowRealizedProfitUsd = round(
+      totalProceedsUsd - assessment.collateralRequiredUsd - totalFeesUsd - assessment.gasUsd,
+      6,
+    );
+
+    this.executionsSucceeded += 1;
+    this.shadowExecutionsFilled += 1;
+    this.recordFill(intendedShares, shadowRealizedSlippageUsd);
+    this.releaseExposure(
+      reservationId,
+      "Paper ceiling shadow fill completed without opening live exposure.",
+    );
+
+    return {
+      mode: modeOverride ?? "paper",
+      success: true,
+      strategyType: "binary_ceiling",
+      market: assessment.market,
+      timestamp: Date.now(),
+      tradeSize: assessment.tradeSize,
+      expectedProfitUsd: assessment.expectedProfitUsd,
+      estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      orderIds: [],
+      hedgeOrderIds: [],
+      hedged: false,
+      notes: [
+        `Paper shadow fill confirmed after ${shadowLatencyMs}ms.`,
+        "No split or sell order was posted to the exchange.",
+      ],
+      shadowFillSuccess: true,
+      shadowFillReason: "Both sell legs remained fully executable inside the configured FOK limits.",
+      shadowLatencyMs,
+      shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd,
+    };
+  }
+
+  private async executePaperNegRisk(
+    assessment: NegRiskAssessment,
+    reservationId: string,
+    intendedShares: number,
+    modeOverride?: ExecutionMode,
+  ): Promise<ExecutionResult> {
+    const shadowLatencyMs = this.config.paperShadowLatencyMs;
+    this.shadowExecutionsAttempted += 1;
+    await sleep(shadowLatencyMs);
+
+    const sourceFill = this.evaluateShadowOrder(
+      assessment.market.conditionId,
+      assessment.sourceNo.tokenId,
+      "BUY",
+      assessment.tradeSize,
+      assessment.sourceNo.worstPrice,
+      assessment.sourceNo.averagePrice,
+    );
+
+    if (!sourceFill.full) {
+      return this.buildPaperFailureResult(
+        "neg_risk_arb",
+        assessment.market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        reservationId,
+        shadowLatencyMs,
+        sourceFill.reason ?? "Shadow neg-risk source leg could not be bought inside the limit.",
+        modeOverride,
+        {
+          groupId: assessment.groupId,
+          groupSlug: assessment.groupSlug,
+          groupQuestion: assessment.groupQuestion,
+        },
+      );
+    }
+
+    const targetFills = assessment.targetYesLegs.map((leg) =>
+      this.evaluateShadowOrder(
+        leg.market.conditionId,
+        leg.tokenId,
+        "SELL",
+        leg.outputSize,
+        leg.worstPrice,
+        leg.averagePrice,
+      ),
+    );
+    const failedTarget = targetFills.find((fill) => !fill.full);
+    if (failedTarget) {
+      return this.buildPaperFailureResult(
+        "neg_risk_arb",
+        assessment.market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        reservationId,
+        shadowLatencyMs,
+        failedTarget.reason ?? "Shadow neg-risk basket could not fully exit on converted YES legs.",
+        modeOverride,
+        {
+          groupId: assessment.groupId,
+          groupSlug: assessment.groupSlug,
+          groupQuestion: assessment.groupQuestion,
+        },
+      );
+    }
+
+    const totalSpendUsd = sourceFill.totalValueUsd;
+    const totalProceedsUsd = sum(targetFills.map((fill) => fill.totalValueUsd));
+    const totalFeesUsd =
+      this.estimateShadowFeeUsd(
+        sourceFill.executableSize,
+        sourceFill.averagePrice,
+        assessment.sourceNo.fee.feeRateBps,
+      ) +
+      sum(
+        targetFills.map((fill, index) =>
+          this.estimateShadowFeeUsd(
+            fill.executableSize,
+            fill.averagePrice,
+            assessment.targetYesLegs[index]?.fee.feeRateBps ?? 0,
+          ),
+        ),
+      );
+    const shadowRealizedSlippageUsd = round(
+      sourceFill.realizedSlippageUsd + sum(targetFills.map((fill) => fill.realizedSlippageUsd)),
+      6,
+    );
+    const shadowRealizedProfitUsd = round(
+      totalProceedsUsd - totalSpendUsd - totalFeesUsd - assessment.gasUsd,
+      6,
+    );
+
+    this.executionsSucceeded += 1;
+    this.shadowExecutionsFilled += 1;
+    this.recordFill(intendedShares, shadowRealizedSlippageUsd);
+    this.releaseExposure(
+      reservationId,
+      "Paper neg-risk shadow fill completed without opening live exposure.",
+    );
+
+    return {
+      mode: modeOverride ?? "paper",
+      success: true,
+      strategyType: "neg_risk_arb",
+      market: assessment.market,
+      groupId: assessment.groupId,
+      groupSlug: assessment.groupSlug,
+      groupQuestion: assessment.groupQuestion,
+      timestamp: Date.now(),
+      tradeSize: assessment.tradeSize,
+      expectedProfitUsd: assessment.expectedProfitUsd,
+      estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      orderIds: [],
+      hedgeOrderIds: [],
+      hedged: false,
+      notes: [
+        `Paper shadow fill confirmed after ${shadowLatencyMs}ms.`,
+        "No source buy, conversion, or basket sell was posted to the exchange.",
+      ],
+      shadowFillSuccess: true,
+      shadowFillReason: "Source NO and converted YES basket remained fully executable inside configured limits.",
+      shadowLatencyMs,
+      shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd,
+    };
+  }
+
+  private async executePaperLateResolution(
+    assessment: LateResolutionAssessment,
+    reservationId: string,
+    intendedShares: number,
+    modeOverride?: ExecutionMode,
+  ): Promise<ExecutionResult> {
+    const shadowLatencyMs = this.config.paperShadowLatencyMs;
+    this.shadowExecutionsAttempted += 1;
+    await sleep(shadowLatencyMs);
+
+    const fill = this.evaluateShadowOrder(
+      assessment.market.conditionId,
+      assessment.leg.tokenId,
+      "BUY",
+      assessment.tradeSize,
+      assessment.leg.worstPrice,
+      assessment.leg.averagePrice,
+    );
+
+    if (!fill.full) {
+      return this.buildPaperFailureResult(
+        "late_resolution",
+        assessment.market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        reservationId,
+        shadowLatencyMs,
+        fill.reason ?? "Shadow late-resolution leg could not be bought inside the limit.",
+        modeOverride,
+        { resolvedOutcome: assessment.resolvedOutcome },
+      );
+    }
+
+    const totalSpendUsd = fill.totalValueUsd;
+    const totalFeesUsd = this.estimateShadowFeeUsd(
+      fill.executableSize,
+      fill.averagePrice,
+      assessment.leg.fee.feeRateBps,
+    );
+    const shadowRealizedSlippageUsd = round(fill.realizedSlippageUsd, 6);
+    const shadowRealizedProfitUsd = round(
+      assessment.tradeSize - totalSpendUsd - totalFeesUsd - assessment.gasUsd,
+      6,
+    );
+
+    this.executionsSucceeded += 1;
+    this.shadowExecutionsFilled += 1;
+    this.recordFill(intendedShares, shadowRealizedSlippageUsd);
+    this.releaseExposure(
+      reservationId,
+      "Paper late-resolution shadow fill completed without opening live exposure.",
+    );
+
+    return {
+      mode: modeOverride ?? "paper",
+      success: true,
+      strategyType: "late_resolution",
+      market: assessment.market,
+      timestamp: Date.now(),
+      tradeSize: assessment.tradeSize,
+      expectedProfitUsd: assessment.expectedProfitUsd,
+      estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      orderIds: [],
+      hedgeOrderIds: [],
+      hedged: false,
+      resolvedOutcome: assessment.resolvedOutcome,
+      notes: [
+        `Paper shadow fill confirmed after ${shadowLatencyMs}ms.`,
+        "No order was posted to the exchange.",
+      ],
+      shadowFillSuccess: true,
+      shadowFillReason: "Resolved-side leg remained fully executable inside the configured FOK limit.",
+      shadowLatencyMs,
+      shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd,
+    };
+  }
+
   private async buildBinarySuccessResult(
     assessment: RiskAssessment,
     reservationId: string,
@@ -1660,7 +2369,10 @@ export class ExecutionEngine {
     let portfolioReconciliation: PortfolioReconciliationResult | undefined;
 
     if (reconciliation.fullyFlat) {
-      this.riskManager.release(reservationId);
+      this.releaseExposure(
+        reservationId,
+        "Live binary reconciliation confirmed no residual exposure.",
+      );
       notes.push("Live reconciliation confirmed no residual exposure; reservation released.");
     } else if (reconciliation.bothCovered) {
       const postFill = await this.handleBinaryPostFill(assessment);
@@ -1669,8 +2381,16 @@ export class ExecutionEngine {
       notes.push(...postFill.notes);
 
       if (postFill.releaseReservation) {
-        this.riskManager.release(reservationId);
+        this.releaseExposure(
+          reservationId,
+          "Reservation released after confirmed binary CTF settlement.",
+        );
         notes.push("Reservation released after confirmed CTF settlement.");
+      } else {
+        this.retainReservation(
+          reservationId,
+          "Binary post-fill handling kept the paired inventory open.",
+        );
       }
     }
 
@@ -1727,7 +2447,7 @@ export class ExecutionEngine {
       "flat",
     );
     notes.push(...portfolioReconciliation.notes);
-    this.riskManager.release(reservationId);
+    this.releaseExposure(reservationId, "Reservation released after ceiling arb completed.");
     notes.push("Reservation released after ceiling arb completed.");
 
     this.executionsSucceeded += 1;
@@ -1771,9 +2491,16 @@ export class ExecutionEngine {
   ): Promise<ExecutionResult> {
     const notes = [...baseNotes, ...reconciliation.notes];
     if (reconciliation.fullyFlat) {
-      this.riskManager.release(reservationId);
+      this.releaseExposure(
+        reservationId,
+        "Live late-resolution reconciliation confirmed no residual exposure.",
+      );
       notes.push("Live reconciliation confirmed no residual exposure; reservation released.");
     } else {
+      this.retainReservation(
+        reservationId,
+        "Late-resolution inventory remains open after a successful fill.",
+      );
       notes.push("Reservation retained while the resolved-side inventory remains open.");
     }
 
@@ -1831,7 +2558,7 @@ export class ExecutionEngine {
       "flat",
     );
     notes.push(...portfolioReconciliation.notes);
-    this.riskManager.release(reservationId);
+    this.releaseExposure(reservationId, "Reservation released after neg-risk arb completed.");
     notes.push("Reservation released after neg-risk arb completed.");
 
     this.executionsSucceeded += 1;
@@ -1887,6 +2614,8 @@ export class ExecutionEngine {
         assessment.sourceNo.tokenId,
         matchedSourceSize,
         "source NO",
+        "neg_risk_arb",
+        assessment.groupId,
       );
       hedgeOrderIds = unwind.hedgeOrderIds;
       hedged = unwind.hedged;
@@ -1896,9 +2625,13 @@ export class ExecutionEngine {
     this.executionsFailed += 1;
 
     if ((sourceReconciliation.fullyFlat || hedged) && !sourceReconciliation.hasOpenOrders) {
-      this.riskManager.release(reservationId);
+      this.releaseExposure(reservationId, "Reservation released after source NO unwind.");
       notes.push("Reservation released after source NO unwind.");
     } else {
+      this.retainReservation(
+        reservationId,
+        "Neg-risk source NO exposure may still be open after failed source fill.",
+      );
       notes.push("Reservation retained due to possible residual source NO exposure.");
     }
 
@@ -2123,6 +2856,8 @@ export class ExecutionEngine {
     tokenId: string,
     size: number,
     label: string,
+    strategyType: ExecutionResult["strategyType"],
+    scopeKey: string,
   ): Promise<{ hedged: boolean; hedgeOrderIds: string[]; notes: string[] }> {
     const client = this.wallet.requireTradingClient();
     const market = this.store.getMarket(conditionId);
@@ -2135,6 +2870,13 @@ export class ExecutionEngine {
     const bestBid = tokenBook?.bestBid ?? tokenBook?.bids[0]?.price;
 
     if (!market || !tokenBook || !bestBid) {
+      this.logHedgeEvent(
+        strategyType,
+        scopeKey,
+        size,
+        `No live bid was available to flatten ${label}.`,
+        false,
+      );
       return {
         hedged: false,
         hedgeOrderIds: [],
@@ -2158,6 +2900,13 @@ export class ExecutionEngine {
       )) as Record<string, unknown>;
 
       this.hedgesTriggered += 1;
+      this.logHedgeEvent(
+        strategyType,
+        scopeKey,
+        size,
+        `Flattened ${label} via FAK SELL.`,
+        true,
+      );
 
       return {
         hedged: true,
@@ -2167,6 +2916,13 @@ export class ExecutionEngine {
     } catch (error) {
       this.tradingGuard.handleError(error, "flatten_token_inventory");
       this.logger.error({ error, conditionId, tokenId }, "Failed to flatten token inventory");
+      this.logHedgeEvent(
+        strategyType,
+        scopeKey,
+        size,
+        `Failed to flatten ${label}.`,
+        false,
+      );
       return {
         hedged: false,
         hedgeOrderIds: [],
@@ -2187,6 +2943,13 @@ export class ExecutionEngine {
     const bestBid = hedgeBook?.bestBid ?? hedgeBook?.bids[0]?.price;
 
     if (!bestBid || !market) {
+      this.logHedgeEvent(
+        "binary_arb",
+        assessment.market.conditionId,
+        Math.abs(imbalance),
+        "No live bid was available for the binary imbalance hedge.",
+        false,
+      );
       return {
         hedged: false,
         hedgeOrderIds: [],
@@ -2212,6 +2975,13 @@ export class ExecutionEngine {
       )) as Record<string, unknown>;
 
       this.hedgesTriggered += 1;
+      this.logHedgeEvent(
+        "binary_arb",
+        assessment.market.conditionId,
+        size,
+        `Flattened ${imbalance > 0 ? "YES" : "NO"} via FAK SELL hedge.`,
+        true,
+      );
       notes.push(`Flattened ${size.toFixed(6)} ${imbalance > 0 ? "YES" : "NO"} via FAK SELL hedge.`);
 
       return {
@@ -2222,6 +2992,13 @@ export class ExecutionEngine {
     } catch (error) {
       this.tradingGuard.handleError(error, "flatten_imbalance");
       this.logger.error({ error, market: assessment.market.slug }, "Failed to hedge imbalance");
+      this.logHedgeEvent(
+        "binary_arb",
+        assessment.market.conditionId,
+        size,
+        "Binary imbalance hedge failed.",
+        false,
+      );
       return {
         hedged: false,
         hedgeOrderIds: [],
@@ -2242,6 +3019,13 @@ export class ExecutionEngine {
     const bestBid = hedgeBook?.bestBid ?? hedgeBook?.bids[0]?.price;
 
     if (!bestBid || !market) {
+      this.logHedgeEvent(
+        "binary_ceiling",
+        assessment.market.conditionId,
+        Math.abs(imbalance),
+        "No live bid was available for the ceiling imbalance hedge.",
+        false,
+      );
       return {
         hedged: false,
         hedgeOrderIds: [],
@@ -2267,6 +3051,13 @@ export class ExecutionEngine {
       )) as Record<string, unknown>;
 
       this.hedgesTriggered += 1;
+      this.logHedgeEvent(
+        "binary_ceiling",
+        assessment.market.conditionId,
+        size,
+        `Flattened ${imbalance > 0 ? "NO" : "YES"} via FAK SELL ceiling hedge.`,
+        true,
+      );
       notes.push(
         `Flattened ${size.toFixed(6)} ${imbalance > 0 ? "NO" : "YES"} via FAK SELL ceiling hedge.`,
       );
@@ -2279,6 +3070,13 @@ export class ExecutionEngine {
     } catch (error) {
       this.tradingGuard.handleError(error, "flatten_ceiling_imbalance");
       this.logger.error({ error, market: assessment.market.slug }, "Failed to hedge ceiling imbalance");
+      this.logHedgeEvent(
+        "binary_ceiling",
+        assessment.market.conditionId,
+        size,
+        "Ceiling imbalance hedge failed.",
+        false,
+      );
       return {
         hedged: false,
         hedgeOrderIds: [],

@@ -83,7 +83,7 @@ export class CliDashboard {
     console.log(
       `Markets: ${snapshot.scanner.marketsTracked} | Tokens: ${snapshot.scanner.tokensTracked} | WS: ${
         snapshot.scanner.websocketConnected ? "connected" : "disconnected"
-      } | Reconnects: ${snapshot.scanner.websocketReconnects}`,
+      } | Reconnects: ${snapshot.scanner.websocketReconnects} | Disconnects: ${snapshot.scanner.websocketDisconnects}`,
     );
     console.log(
       `Last WS msg: ${
@@ -93,7 +93,7 @@ export class CliDashboard {
       } ago`,
     );
     console.log(
-      `Binary arb: seen=${snapshot.arbitrage.opportunitiesSeen} captured=${snapshot.arbitrage.opportunitiesCaptured} viable=${snapshot.arbitrage.opportunitiesViable} executed=${snapshot.arbitrage.opportunitiesExecuted} avgDur=${formatMs(snapshot.arbitrage.averageOpportunityDurationMs)}`,
+      `Binary arb: seen=${snapshot.arbitrage.opportunitiesSeen} captured=${snapshot.arbitrage.opportunitiesCaptured} viable=${snapshot.arbitrage.opportunitiesViable} executed=${snapshot.arbitrage.opportunitiesExecuted} avgDur=${formatMs(snapshot.arbitrage.averageOpportunityDurationMs)} staleSkips=${snapshot.arbitrage.staleBooksSkipped} lastBookAge=${formatMs(snapshot.arbitrage.lastBookAgeMs)}`,
     );
     console.log(
       `Binary ceiling: seen=${snapshot.ceilingArbitrage?.opportunitiesSeen ?? 0} captured=${snapshot.ceilingArbitrage?.opportunitiesCaptured ?? 0} viable=${snapshot.ceilingArbitrage?.opportunitiesViable ?? 0} executed=${snapshot.ceilingArbitrage?.opportunitiesExecuted ?? 0} avgDur=${formatMs(snapshot.ceilingArbitrage?.averageOpportunityDurationMs)}`,
@@ -105,7 +105,7 @@ export class CliDashboard {
       `Late resolution: seen=${snapshot.lateResolution?.opportunitiesSeen ?? 0} captured=${snapshot.lateResolution?.opportunitiesCaptured ?? 0} viable=${snapshot.lateResolution?.opportunitiesViable ?? 0} executed=${snapshot.lateResolution?.opportunitiesExecuted ?? 0} avgDur=${formatMs(snapshot.lateResolution?.averageOpportunityDurationMs)}`,
     );
     console.log(
-      `Executions: attempted=${snapshot.execution.executionsAttempted} success=${snapshot.execution.executionsSucceeded} failed=${snapshot.execution.executionsFailed} hedges=${snapshot.execution.hedgesTriggered} fillRate=${formatPct(snapshot.execution.fillRate)} shareFill=${formatPct(snapshot.execution.shareFillRate)} openNotional=${formatUsd(snapshot.execution.openNotionalUsd)}`,
+      `Executions: attempted=${snapshot.execution.executionsAttempted} success=${snapshot.execution.executionsSucceeded} failed=${snapshot.execution.executionsFailed} hedges=${snapshot.execution.hedgesTriggered} fillRate=${formatPct(snapshot.execution.fillRate)} shadowFill=${formatPct(snapshot.execution.shadowFillRate)} shareFill=${formatPct(snapshot.execution.shareFillRate)} openNotional=${formatUsd(snapshot.execution.openNotionalUsd)} reservations=${snapshot.execution.openReservationsCount}`,
     );
     if (snapshot.tradingGuard) {
       console.log(
@@ -123,6 +123,11 @@ export class CliDashboard {
     console.log(
       `Slippage: estimated=${formatUsd(snapshot.execution.estimatedSlippageUsdTotal)} realized=${formatUsd(snapshot.execution.realizedSlippageUsdTotal)}`,
     );
+    if (snapshot.execution.lastRetainedReservationReason) {
+      console.log(
+        `Reservations: lastRetain="${snapshot.execution.lastRetainedReservationReason}"`,
+      );
+    }
     console.log(`Capture rate: ${formatPct(captureRate)}`);
 
     if (snapshot.recentOpportunities.length === 0) {

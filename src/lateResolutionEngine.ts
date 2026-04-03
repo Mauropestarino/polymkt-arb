@@ -249,6 +249,11 @@ export class LateResolutionEngine extends EventEmitter {
       reconciliationSatisfied: result.reconciliationSatisfied,
       reconciledPortfolioValueUsd: result.reconciledPortfolioValueUsd,
       reconciledPositionCount: result.reconciledPositionCount,
+      shadowFillSuccess: result.shadowFillSuccess,
+      shadowFillReason: result.shadowFillReason,
+      shadowLatencyMs: result.shadowLatencyMs,
+      shadowRealizedProfitUsd: result.shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd: result.shadowRealizedSlippageUsd,
     });
 
     await this.alerts.notifyTrade(result);

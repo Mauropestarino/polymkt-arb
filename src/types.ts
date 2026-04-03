@@ -209,6 +209,11 @@ export interface NegRiskAssessment {
   expectedProfitUsd: number;
   expectedProfitPct: number;
   netEdgePerShare: number;
+  rawSpreadUsd?: number;
+  sourceNoCostUsd?: number;
+  targetYesProceedsUsd?: number;
+  requiredProfitUsd?: number;
+  thresholdDeltaUsd?: number;
 }
 
 export interface OrderStatusSnapshot {
@@ -306,6 +311,11 @@ export interface ExecutionResult {
   reconciliationSatisfied?: boolean;
   reconciledPortfolioValueUsd?: number;
   reconciledPositionCount?: number;
+  shadowFillSuccess?: boolean;
+  shadowFillReason?: string;
+  shadowLatencyMs?: number;
+  shadowRealizedProfitUsd?: number;
+  shadowRealizedSlippageUsd?: number;
 }
 
 export interface OpportunityLogRecord {
@@ -325,6 +335,7 @@ export interface OpportunityLogRecord {
   grossEdgeUsd?: number;
   totalFeesUsd?: number;
   estimatedSlippageUsd?: number;
+  gasUsd?: number;
   expectedProfitUsd: number;
   expectedProfitPct: number;
   viable: boolean;
@@ -332,6 +343,13 @@ export interface OpportunityLogRecord {
   expiredAt?: number;
   opportunity_duration_ms?: number;
   reason?: string;
+  rawSpreadUsd?: number;
+  sourceNoCostUsd?: number;
+  targetYesProceedsUsd?: number;
+  convertFeeBps?: number;
+  convertOutputSize?: number;
+  requiredProfitUsd?: number;
+  thresholdDeltaUsd?: number;
 }
 
 export interface TradeLogRecord {
@@ -363,6 +381,11 @@ export interface TradeLogRecord {
   reconciliationSatisfied?: boolean;
   reconciledPortfolioValueUsd?: number;
   reconciledPositionCount?: number;
+  shadowFillSuccess?: boolean;
+  shadowFillReason?: string;
+  shadowLatencyMs?: number;
+  shadowRealizedProfitUsd?: number;
+  shadowRealizedSlippageUsd?: number;
 }
 
 export interface PersistedMarketSnapshot {
@@ -378,6 +401,7 @@ export interface MarketScannerStats {
   tokensTracked: number;
   websocketConnected: boolean;
   websocketReconnects: number;
+  websocketDisconnects: number;
   lastMessageAt?: number;
 }
 
@@ -390,6 +414,8 @@ export interface ArbitrageEngineStats {
   completedOpportunityCount: number;
   totalOpportunityDurationMs: number;
   lastOpportunityAt?: number;
+  staleBooksSkipped: number;
+  lastBookAgeMs?: number;
 }
 
 export interface LateResolutionStats {
@@ -409,6 +435,10 @@ export interface ExecutionStats {
   executionsFailed: number;
   hedgesTriggered: number;
   openNotionalUsd: number;
+  openReservationsCount: number;
+  shadowExecutionsAttempted: number;
+  shadowExecutionsFilled: number;
+  shadowFillRate: number;
   filledShares: number;
   intendedShares: number;
   fillRate: number;
@@ -417,6 +447,8 @@ export interface ExecutionStats {
   estimatedSlippageUsdAverage: number;
   realizedSlippageUsdTotal: number;
   realizedSlippageUsdAverage: number;
+  lastRetainedReservationReason?: string;
+  lastRetainedReservationAt?: number;
 }
 
 export type TradingPauseReason =
@@ -437,11 +469,16 @@ export interface RuntimeState {
   startedAt: number;
   dryRun: boolean;
   getMarketsTracked(): number;
+  getWebsocketDisconnects(): number;
   getOpenNotionalUsd(): number;
+  getOpenReservationsCount(): number;
   getOpportunitiesDetected(): number;
   getViableOpportunities(): number;
   getTradesExecuted(): number;
   getTradesAttempted(): number;
+  getStaleBooksSkipped(): number;
+  getLastBookAgeMs(): number | undefined;
+  getShadowFillRate(): number;
   getFillRate(): number;
   getShareFillRate(): number;
   getOpportunityCaptureRate(): number;
@@ -452,6 +489,8 @@ export interface RuntimeState {
   getTradingEnabled(): boolean;
   getTradingPauseReason(): string | undefined;
   getTradingResumeAt(): number | undefined;
+  getLastRetainedReservationReason(): string | undefined;
+  getLastRetainedReservationAt(): number | undefined;
 }
 
 export interface NetProfitModelInput {
@@ -482,6 +521,165 @@ export interface DashboardSnapshot {
   execution: ExecutionStats;
   tradingGuard?: TradingGuardStatus;
   recentOpportunities: OpportunityLogRecord[];
+}
+
+export type DashboardStrategyKey = StrategyType | "unknown";
+
+export interface ErrorLogRecord {
+  type: "error";
+  timestamp: number;
+  context?: Record<string, unknown>;
+  error?:
+    | {
+        message?: string;
+        stack?: string;
+      }
+    | string
+    | Record<string, unknown>;
+}
+
+export interface DashboardProfitPoint {
+  timestamp: number;
+  cumulativeExpectedProfitUsd: number;
+  cumulativeRealizedProfitUsd: number;
+  cumulativeShadowRealizedProfitUsd: number;
+  tradeCount: number;
+}
+
+export interface DashboardStrategyPerformance {
+  strategyType: DashboardStrategyKey;
+  trades: number;
+  successes: number;
+  failures: number;
+  hedgedTrades: number;
+  winRate: number;
+  totalTradeSize: number;
+  averageTradeSize: number;
+  totalExpectedProfitUsd: number;
+  totalRealizedProfitUsd: number;
+  totalShadowRealizedProfitUsd: number;
+  averageRealizedProfitUsd: number;
+  averageShadowRealizedProfitUsd: number;
+  totalEstimatedSlippageUsd: number;
+  totalRealizedSlippageUsd: number;
+  totalShadowRealizedSlippageUsd: number;
+  shadowAttempts: number;
+  shadowSuccesses: number;
+  shadowFillRate: number;
+}
+
+export interface DashboardModePerformance {
+  mode: ExecutionResult["mode"];
+  trades: number;
+  successes: number;
+  failures: number;
+  successRate: number;
+  totalRealizedProfitUsd: number;
+  totalShadowRealizedProfitUsd: number;
+  shadowAttempts: number;
+  shadowSuccesses: number;
+  shadowFillRate: number;
+}
+
+export interface DashboardOpportunityStrategySummary {
+  strategyType: DashboardStrategyKey;
+  total: number;
+  viable: number;
+  rejected: number;
+  viableRate: number;
+  averageDurationMs?: number;
+}
+
+export interface DashboardReasonCount {
+  label: string;
+  count: number;
+}
+
+export interface DashboardStrategyReasonSummary {
+  strategyType: DashboardStrategyKey;
+  reasons: DashboardReasonCount[];
+}
+
+export interface DashboardTradeSummary {
+  totalTrades: number;
+  successfulTrades: number;
+  failedTrades: number;
+  successRate: number;
+  hedgedTrades: number;
+  totalTradeSize: number;
+  averageTradeSize: number;
+  totalExpectedProfitUsd: number;
+  totalRealizedProfitUsd: number;
+  totalShadowRealizedProfitUsd: number;
+  averageRealizedProfitUsd: number;
+  averageShadowRealizedProfitUsd: number;
+  totalEstimatedSlippageUsd: number;
+  totalRealizedSlippageUsd: number;
+  totalShadowRealizedSlippageUsd: number;
+  submittedOrders: number;
+  submittedHedgeOrders: number;
+  uniqueMarkets: number;
+  latestTradeAt?: number;
+  shadowAttempts: number;
+  shadowSuccesses: number;
+  shadowFillRate: number;
+  topShadowFillReasons: DashboardReasonCount[];
+}
+
+export interface DashboardOpportunitySummary {
+  total: number;
+  viable: number;
+  rejected: number;
+  viableRate: number;
+  positiveExpectedProfit: number;
+  averageDurationMs?: number;
+  minDurationMs?: number;
+  maxDurationMs?: number;
+  topRejectionReasons: DashboardReasonCount[];
+}
+
+export interface DashboardErrorSummary {
+  timestamp: number;
+  message: string;
+  source?: string;
+  event?: string;
+  reconnects?: number;
+}
+
+export interface DashboardActivityItem {
+  type: "trade" | "opportunity" | "error";
+  timestamp: number;
+  title: string;
+  detail: string;
+  tone: "positive" | "warning" | "danger" | "neutral";
+}
+
+export interface DashboardLogAnalytics {
+  generatedAt: number;
+  firstEventAt?: number;
+  lastEventAt?: number;
+  totalErrors: number;
+  latestErrorAt?: number;
+  tradeSummary: DashboardTradeSummary;
+  strategyPerformance: DashboardStrategyPerformance[];
+  modePerformance: DashboardModePerformance[];
+  opportunitySummary: DashboardOpportunitySummary;
+  opportunityByStrategy: DashboardOpportunityStrategySummary[];
+  recentTrades: TradeLogRecord[];
+  recentOpportunities: OpportunityLogRecord[];
+  negRiskNearMisses: OpportunityLogRecord[];
+  shadowFillReasons: DashboardReasonCount[];
+  shadowFillReasonsByStrategy: DashboardStrategyReasonSummary[];
+  recentErrors: DashboardErrorSummary[];
+  profitSeries: DashboardProfitPoint[];
+  activityFeed: DashboardActivityItem[];
+}
+
+export interface DashboardApiResponse {
+  generatedAt: number;
+  snapshot: DashboardSnapshot;
+  analytics: DashboardLogAnalytics;
+  dryRun: boolean;
 }
 
 export interface LateResolutionSignal {

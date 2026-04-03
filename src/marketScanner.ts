@@ -2,7 +2,12 @@ import { EventEmitter } from "node:events";
 import WebSocket from "ws";
 import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
-import type { MarketBookState, MarketDefinition, OrderBookLevel } from "./types.js";
+import type {
+  MarketBookState,
+  MarketDefinition,
+  MarketScannerStats,
+  OrderBookLevel,
+} from "./types.js";
 import {
   chunk,
   computeBackoffDelay,
@@ -24,6 +29,7 @@ export class MarketScanner extends EventEmitter {
   private reconnectTimer?: NodeJS.Timeout;
   private reseedPromise?: Promise<void>;
   private reconnects = 0;
+  private disconnects = 0;
   private stopped = false;
   private lastMessageAt?: number;
 
@@ -39,6 +45,9 @@ export class MarketScanner extends EventEmitter {
 
   async start(): Promise<MarketDefinition[]> {
     this.stopped = false;
+    this.reconnects = 0;
+    this.disconnects = 0;
+    this.lastMessageAt = undefined;
     this.logger.info("Fetching active markets from Gamma API");
     const markets = await this.fetchActiveMarkets();
     this.store.registerMarkets(markets);
@@ -65,18 +74,13 @@ export class MarketScanner extends EventEmitter {
     }
   }
 
-  getStats(): {
-    marketsTracked: number;
-    tokensTracked: number;
-    websocketConnected: boolean;
-    websocketReconnects: number;
-    lastMessageAt?: number;
-  } {
+  getStats(): MarketScannerStats {
     return {
       marketsTracked: this.store.getAllMarkets().length,
       tokensTracked: this.store.getTrackedTokenIds().length,
       websocketConnected: this.websocket?.readyState === WebSocket.OPEN,
       websocketReconnects: this.reconnects,
+      websocketDisconnects: this.disconnects,
       lastMessageAt: this.lastMessageAt,
     };
   }
@@ -398,6 +402,7 @@ export class MarketScanner extends EventEmitter {
         }
 
         if (!this.stopped && isCurrentSocket) {
+          this.disconnects += 1;
           this.reconnects += 1;
           this.logger.warn(
             { reconnects: this.reconnects, code, reason: reason || undefined },
@@ -690,6 +695,7 @@ export class MarketScanner extends EventEmitter {
 
     this.websocket = undefined;
     this.clearConnectionTimers();
+    this.disconnects += 1;
     this.reconnects += 1;
 
     try {

@@ -61,6 +61,8 @@ export class NegRiskEngine extends EventEmitter {
       completedOpportunityCount: this.completedOpportunityCount,
       totalOpportunityDurationMs: this.totalOpportunityDurationMs,
       lastOpportunityAt: this.lastOpportunityAt,
+      staleBooksSkipped: 0,
+      lastBookAgeMs: undefined,
     };
   }
 
@@ -259,15 +261,23 @@ export class NegRiskEngine extends EventEmitter {
       groupQuestion: group.title,
       strategyType: "neg_risk_arb",
       arb: assessment.arb,
+      rawSpreadUsd: assessment.rawSpreadUsd,
       tradeSize: assessment.tradeSize,
       grossEdgeUsd: assessment.grossEdgeUsd,
       totalFeesUsd: assessment.totalFeesUsd,
       estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      gasUsd: assessment.gasUsd,
       expectedProfitUsd: assessment.expectedProfitUsd,
       expectedProfitPct: assessment.expectedProfitPct,
       viable: assessment.viable,
       detectedAt: activeWindow.detectedAt,
       reason: assessment.reason,
+      sourceNoCostUsd: assessment.sourceNoCostUsd,
+      targetYesProceedsUsd: assessment.targetYesProceedsUsd,
+      convertFeeBps: assessment.convertFeeBps,
+      convertOutputSize: assessment.convertOutputSize,
+      requiredProfitUsd: assessment.requiredProfitUsd,
+      thresholdDeltaUsd: assessment.thresholdDeltaUsd,
     };
 
     activeWindow.lastAssessment = assessment;
@@ -282,6 +292,12 @@ export class NegRiskEngine extends EventEmitter {
           arb: assessment.arb,
           tradeSize: assessment.tradeSize,
           expectedProfitUsd: assessment.expectedProfitUsd,
+          rawSpreadUsd: assessment.rawSpreadUsd,
+          sourceNoCostUsd: assessment.sourceNoCostUsd,
+          targetYesProceedsUsd: assessment.targetYesProceedsUsd,
+          convertFeeBps: assessment.convertFeeBps,
+          requiredProfitUsd: assessment.requiredProfitUsd,
+          thresholdDeltaUsd: assessment.thresholdDeltaUsd,
           reason: assessment.reason,
         },
         "Neg-risk opportunity rejected by risk manager",
@@ -344,6 +360,11 @@ export class NegRiskEngine extends EventEmitter {
       reconciliationSatisfied: result.reconciliationSatisfied,
       reconciledPortfolioValueUsd: result.reconciledPortfolioValueUsd,
       reconciledPositionCount: result.reconciledPositionCount,
+      shadowFillSuccess: result.shadowFillSuccess,
+      shadowFillReason: result.shadowFillReason,
+      shadowLatencyMs: result.shadowLatencyMs,
+      shadowRealizedProfitUsd: result.shadowRealizedProfitUsd,
+      shadowRealizedSlippageUsd: result.shadowRealizedSlippageUsd,
     });
 
     await this.alerts.notifyTrade(result);

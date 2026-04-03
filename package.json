@@ -5,7 +5,8 @@
   "description": "Production-oriented Polymarket arbitrage bot built with Node.js and TypeScript.",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/main.ts",
+    "dev": "npm run build && node dist/main.js",
+    "dev:watch": "tsx watch src/main.ts",
     "start": "node dist/main.js",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
