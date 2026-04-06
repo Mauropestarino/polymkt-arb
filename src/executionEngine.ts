@@ -3,17 +3,20 @@ import type { Logger } from "pino";
 import type { BotConfig } from "./config.js";
 import { CtfSettlementService } from "./ctfSettlement.js";
 import { PortfolioReconciler } from "./portfolioReconciler.js";
+import { TemporalArbRiskManager } from "./temporalArbRiskManager.js";
 import type {
   CeilingAssessment,
   ExecutionResult,
   ExecutionStats,
   LateResolutionAssessment,
   MarketBookState,
+  MarketDefinition,
   NegRiskAssessment,
   OrderStatusSnapshot,
   PortfolioReconciliationResult,
   RiskAssessment,
   SettlementReceipt,
+  TemporalArbAssessment,
   TokenBookState,
 } from "./types.js";
 import { round, sum, stableId, sleep, toTickSize } from "./lib/utils.js";
@@ -99,6 +102,7 @@ type ShadowOrderEvaluation = {
 interface ExecutionEngineDependencies {
   ctfSettlement?: CtfSettlementService;
   portfolioReconciler?: PortfolioReconciler;
+  temporalArbRiskManager?: TemporalArbRiskManager;
 }
 
 export class ExecutionEngine {
@@ -166,6 +170,9 @@ export class ExecutionEngine {
   private releaseExposure(reservationId: string, reason: string): void {
     const entry = this.reservationAudit.get(reservationId);
     this.riskManager.release(reservationId);
+    if (entry?.strategyType === "temporal_arb") {
+      this.dependencies.temporalArbRiskManager?.releaseSymbolExposure(reservationId);
+    }
     if (entry) {
       this.reservationAudit.delete(reservationId);
     }
@@ -198,6 +205,50 @@ export class ExecutionEngine {
       },
       "Retained reservation due to unresolved exposure",
     );
+  }
+
+  private reserveTemporalSymbolExposure(
+    reservationId: string,
+    assessment: TemporalArbAssessment,
+  ): boolean {
+    return (
+      this.dependencies.temporalArbRiskManager?.reserveSymbolExposure(
+        reservationId,
+        assessment.market.symbol,
+        assessment.totalSpendUsd,
+      ) ?? true
+    );
+  }
+
+  private buildTemporalExecutionMarket(assessment: TemporalArbAssessment): MarketDefinition {
+    return {
+      id: assessment.market.conditionId,
+      conditionId: assessment.market.conditionId,
+      slug: assessment.market.slug,
+      question: assessment.market.question,
+      category: "crypto",
+      endDate: new Date(assessment.market.windowEndMs).toISOString(),
+      active: true,
+      closed: false,
+      liquidity: 0,
+      volume24hr: 0,
+      yesTokenId: assessment.market.yesTokenId,
+      noTokenId: assessment.market.noTokenId,
+      yesLabel: "Yes",
+      noLabel: "No",
+      tickSizeHint: assessment.market.tickSizeHint,
+      negRisk: assessment.market.negRisk,
+      makerBaseFee: undefined,
+      takerBaseFee: undefined,
+    };
+  }
+
+  private buildTemporalExecutionNotes(assessment: TemporalArbAssessment): string[] {
+    return [
+      `Resolution confidence=${assessment.resolutionConfidence.toFixed(3)}.`,
+      `Spot=${assessment.signal.spotPrice.toFixed(2)} strike=${assessment.signal.strikePrice.toFixed(2)} source=${assessment.signal.spotSource}.`,
+      `Normalized edge=${assessment.signal.normalizedEdge.toFixed(6)} timeRemainingMs=${Math.max(0, assessment.signal.timeRemainingMs)}.`,
+    ];
   }
 
   private logHedgeEvent(
@@ -1443,6 +1494,313 @@ export class ExecutionEngine {
     }
   }
 
+  /**
+   * Executes a single-leg temporal-arbitrage buy using the shared reservation and reconciliation flow.
+   */
+  async executeTemporal(
+    assessment: TemporalArbAssessment,
+    modeOverride?: ExecutionMode,
+  ): Promise<ExecutionResult> {
+    const market = this.buildTemporalExecutionMarket(assessment);
+    const reservationId = stableId(
+      "temporal_arb",
+      market.conditionId,
+      String(assessment.timestamp),
+      String(assessment.tradeSize),
+      assessment.signal.direction,
+    );
+    const intendedShares = assessment.tradeSize;
+    const temporalNotes = this.buildTemporalExecutionNotes(assessment);
+
+    if (!this.tradingGuard.isTradingEnabled()) {
+      const pausedResult = this.buildTradingPausedResult(
+        "temporal_arb",
+        market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        modeOverride,
+      );
+      return {
+        ...pausedResult,
+        notes: [...temporalNotes, ...pausedResult.notes],
+      };
+    }
+
+    this.recordAttempt(intendedShares, assessment.estimatedSlippageUsd);
+    this.marketLocks.add(market.conditionId);
+
+    if (!this.reserveTemporalSymbolExposure(reservationId, assessment)) {
+      this.marketLocks.delete(market.conditionId);
+      this.executionsFailed += 1;
+      return {
+        mode: modeOverride ?? (this.config.dryRun ? "paper" : "live"),
+        success: false,
+        strategyType: "temporal_arb",
+        market,
+        timestamp: Date.now(),
+        tradeSize: assessment.tradeSize,
+        expectedProfitUsd: assessment.expectedProfitUsd,
+        estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+        orderIds: [],
+        hedgeOrderIds: [],
+        hedged: false,
+        notes: [...temporalNotes, "Temporal symbol-exposure cap rejected the reservation."],
+      };
+    }
+
+    if (
+      !this.reserveExposure(
+        reservationId,
+        "temporal_arb",
+        market.conditionId,
+        assessment.totalSpendUsd,
+      )
+    ) {
+      this.dependencies.temporalArbRiskManager?.releaseSymbolExposure(reservationId);
+      this.marketLocks.delete(market.conditionId);
+      this.executionsFailed += 1;
+      return {
+        mode: modeOverride ?? (this.config.dryRun ? "paper" : "live"),
+        success: false,
+        strategyType: "temporal_arb",
+        market,
+        timestamp: Date.now(),
+        tradeSize: assessment.tradeSize,
+        expectedProfitUsd: assessment.expectedProfitUsd,
+        estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+        orderIds: [],
+        hedgeOrderIds: [],
+        hedged: false,
+        notes: [...temporalNotes, "Reservation rejected by max open notional rule."],
+      };
+    }
+
+    let trackedOrder: TrackedOrder | undefined;
+    let responses: Array<Record<string, unknown>> = [];
+    let postAttempted = false;
+
+    try {
+      if (modeOverride === "backtest" || this.config.dryRun) {
+        return this.executePaperTemporal(assessment, market, reservationId, intendedShares, modeOverride);
+      }
+
+      const client = this.wallet.requireTradingClient();
+      const orderType = OrderType.FOK;
+      const negRisk = assessment.market.negRisk ?? false;
+      const tickSize = this.resolveTickSize(
+        market.conditionId,
+        assessment.leg.tokenId,
+        market.tickSizeHint,
+      );
+
+      const order = await client.createOrder(
+        {
+          tokenID: assessment.leg.tokenId,
+          price: assessment.leg.worstPrice,
+          size: assessment.tradeSize,
+          side: Side.BUY,
+        },
+        { tickSize, negRisk },
+      );
+
+      trackedOrder = {
+        tokenId: assessment.leg.tokenId,
+        expectedSize: assessment.tradeSize,
+        expectedAveragePrice: assessment.leg.averagePrice,
+        side: "BUY",
+      };
+
+      postAttempted = true;
+      responses = (await client.postOrders([{ order, orderType }])) as Array<Record<string, unknown>>;
+      [trackedOrder] = this.attachOrderIds([trackedOrder], responses);
+      if (!trackedOrder) {
+        throw new Error("Unable to track temporal-arb order after submission.");
+      }
+
+      const reconciliation = await this.reconcileSingleOrderExecution(
+        trackedOrder,
+        responses,
+        assessment.tradeSize,
+      );
+      this.recordFill(reconciliation.matchedShares, reconciliation.realizedSlippageUsd);
+
+      if (reconciliation.fullyFilled) {
+        return this.buildTemporalSuccessResult(
+          assessment,
+          market,
+          reservationId,
+          reconciliation,
+          temporalNotes,
+        );
+      }
+
+      this.executionsFailed += 1;
+      const notes = [...temporalNotes, ...reconciliation.notes];
+      if (reconciliation.fullyFlat) {
+        this.releaseExposure(
+          reservationId,
+          "Temporal-arb live reconciliation confirmed no residual exposure.",
+        );
+        notes.push("Live reconciliation confirmed no residual exposure; reservation released.");
+      }
+      return {
+        mode: "live",
+        success: false,
+        strategyType: "temporal_arb",
+        market,
+        timestamp: Date.now(),
+        tradeSize: assessment.tradeSize,
+        expectedProfitUsd: assessment.expectedProfitUsd,
+        estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+        realizedSlippageUsd: reconciliation.realizedSlippageUsd,
+        orderIds: reconciliation.orderIds,
+        hedgeOrderIds: [],
+        hedged: false,
+        notes: reconciliation.fullyFlat
+          ? [...notes, "Temporal-arb order did not fully fill."]
+          : (() => {
+              this.retainReservation(
+                reservationId,
+                "Temporal-arb order partially filled and may still hold live exposure.",
+              );
+              return [
+                ...notes,
+                "Temporal-arb order partially filled; reservation retained for open exposure.",
+              ];
+            })(),
+      };
+    } catch (error) {
+      this.tradingGuard.handleError(error, "temporal_arb_execute");
+      const notes: string[] = [...temporalNotes];
+      const recoveredResponses = this.extractRecoveredResponses(error);
+      if (recoveredResponses.length > 0) {
+        responses = recoveredResponses;
+        if (trackedOrder) {
+          [trackedOrder] = this.attachOrderIds([trackedOrder], responses);
+        }
+      }
+
+      if (postAttempted) {
+        if (trackedOrder?.orderId || responses.length > 0) {
+          try {
+            const reconciliation = await this.reconcileSingleOrderExecution(
+              trackedOrder ?? {
+                tokenId: assessment.leg.tokenId,
+                expectedSize: assessment.tradeSize,
+                expectedAveragePrice: assessment.leg.averagePrice,
+                side: "BUY",
+              },
+              responses,
+              assessment.tradeSize,
+            );
+            this.recordFill(reconciliation.matchedShares, reconciliation.realizedSlippageUsd);
+
+            this.logger.warn(
+              {
+                error,
+                market: market.slug,
+                orderIds: reconciliation.orderIds,
+              },
+              "Temporal-arb execution threw after order submission; reconciled live state",
+            );
+
+            if (reconciliation.fullyFilled) {
+              return this.buildTemporalSuccessResult(
+                assessment,
+                market,
+                reservationId,
+                reconciliation,
+                [
+                  ...temporalNotes,
+                  error instanceof Error ? error.message : "Unknown execution error",
+                ],
+              );
+            }
+
+            this.executionsFailed += 1;
+            notes.push(...reconciliation.notes);
+            if (reconciliation.fullyFlat) {
+              this.releaseExposure(
+                reservationId,
+                "Post-error temporal-arb reconciliation confirmed no residual exposure.",
+              );
+              notes.push("Post-error reconciliation confirmed no residual exposure; reservation released.");
+            } else {
+              this.retainReservation(
+                reservationId,
+                "Post-error temporal-arb reconciliation found possible live exposure.",
+              );
+              notes.push("Reservation retained after post-error reconciliation due to possible live exposure.");
+            }
+            return {
+              mode: "live",
+              success: false,
+              strategyType: "temporal_arb",
+              market,
+              timestamp: Date.now(),
+              tradeSize: assessment.tradeSize,
+              expectedProfitUsd: assessment.expectedProfitUsd,
+              estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+              realizedSlippageUsd: reconciliation.realizedSlippageUsd,
+              orderIds: reconciliation.orderIds,
+              hedgeOrderIds: [],
+              hedged: false,
+              notes: [
+                error instanceof Error ? error.message : "Unknown execution error",
+                ...notes,
+                "Temporal-arb order did not fully fill.",
+              ],
+            };
+          } catch (reconciliationError) {
+            notes.push(
+              reconciliationError instanceof Error
+                ? `Post-error reconciliation failed: ${reconciliationError.message}`
+                : "Post-error reconciliation failed.",
+            );
+            this.retainReservation(
+              reservationId,
+              "Post-error temporal-arb reconciliation failed after order submission.",
+            );
+            notes.push("Reservation retained until manual reconciliation confirms no live exposure.");
+          }
+        } else {
+          this.retainReservation(
+            reservationId,
+            "Temporal-arb order submission crossed the exchange boundary without order IDs.",
+          );
+          notes.push("Order submission crossed the exchange boundary before failing; reservation retained.");
+          notes.push("Manual reconciliation is required because no order IDs were returned.");
+        }
+      } else {
+        this.releaseExposure(
+          reservationId,
+          "Temporal-arb execution failed before any live order was posted.",
+        );
+      }
+
+      this.executionsFailed += 1;
+      this.logger.error({ error, market: market.slug }, "Temporal-arb execution failed");
+
+      return {
+        mode: modeOverride ?? (this.config.dryRun ? "paper" : "live"),
+        success: false,
+        strategyType: "temporal_arb",
+        market,
+        timestamp: Date.now(),
+        tradeSize: assessment.tradeSize,
+        expectedProfitUsd: assessment.expectedProfitUsd,
+        estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+        orderIds: trackedOrder?.orderId ? [trackedOrder.orderId] : [],
+        hedgeOrderIds: [],
+        hedged: false,
+        notes: [error instanceof Error ? error.message : "Unknown execution error", ...notes],
+      };
+    } finally {
+      this.marketLocks.delete(market.conditionId);
+    }
+  }
+
   private async pollOrderSnapshots(
     orders: TrackedOrder[],
     responses: Array<Record<string, unknown>>,
@@ -2358,6 +2716,97 @@ export class ExecutionEngine {
     };
   }
 
+  private async executePaperTemporal(
+    assessment: TemporalArbAssessment,
+    market: MarketDefinition,
+    reservationId: string,
+    intendedShares: number,
+    modeOverride?: ExecutionMode,
+  ): Promise<ExecutionResult> {
+    const shadowLatencyMs = this.config.paperShadowLatencyMs;
+    const temporalNotes = this.buildTemporalExecutionNotes(assessment);
+    this.shadowExecutionsAttempted += 1;
+    await sleep(shadowLatencyMs);
+
+    const fill = this.evaluateShadowOrder(
+      market.conditionId,
+      assessment.leg.tokenId,
+      "BUY",
+      assessment.tradeSize,
+      assessment.leg.worstPrice,
+      assessment.leg.averagePrice,
+    );
+
+    if (!fill.full) {
+      return this.buildPaperFailureResult(
+        "temporal_arb",
+        market,
+        assessment.tradeSize,
+        assessment.expectedProfitUsd,
+        assessment.estimatedSlippageUsd,
+        reservationId,
+        shadowLatencyMs,
+        fill.reason ?? "Shadow temporal-arb leg could not be bought inside the configured FOK limit.",
+        modeOverride,
+        {
+          notes: [
+            `Paper shadow fill failed after ${shadowLatencyMs}ms.`,
+            fill.reason ?? "Shadow temporal-arb leg could not be bought inside the configured FOK limit.",
+            "No order was posted to the exchange.",
+            ...temporalNotes,
+          ],
+        },
+      );
+    }
+
+    const totalFeesUsd = this.estimateShadowFeeUsd(
+      fill.executableSize,
+      fill.averagePrice,
+      assessment.leg.fee.feeRateBps,
+    );
+    const shadowRealizedSlippageUsd = round(fill.realizedSlippageUsd, 6);
+    const shadowExpectedProfitUsd = round(
+      assessment.tradeSize * (assessment.resolutionConfidence - fill.averagePrice) -
+        totalFeesUsd -
+        assessment.gasUsd -
+        shadowRealizedSlippageUsd,
+      6,
+    );
+
+    this.executionsSucceeded += 1;
+    this.shadowExecutionsFilled += 1;
+    this.recordFill(intendedShares, shadowRealizedSlippageUsd);
+    this.releaseExposure(
+      reservationId,
+      "Paper temporal-arb shadow fill completed without opening live exposure.",
+    );
+
+    return {
+      mode: modeOverride ?? "paper",
+      success: true,
+      strategyType: "temporal_arb",
+      market,
+      timestamp: Date.now(),
+      tradeSize: assessment.tradeSize,
+      expectedProfitUsd: assessment.expectedProfitUsd,
+      estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      orderIds: [],
+      hedgeOrderIds: [],
+      hedged: false,
+      notes: [
+        `Paper shadow fill confirmed after ${shadowLatencyMs}ms.`,
+        "No order was posted to the exchange.",
+        ...temporalNotes,
+        "Paper temporal PnL is tracked as expected value because the market has not resolved yet.",
+      ],
+      shadowFillSuccess: true,
+      shadowFillReason: "Temporal leg remained fully executable inside the configured FOK limit.",
+      shadowLatencyMs,
+      shadowRealizedProfitUsd: shadowExpectedProfitUsd,
+      shadowRealizedSlippageUsd,
+    };
+  }
+
   private async buildBinarySuccessResult(
     assessment: RiskAssessment,
     reservationId: string,
@@ -2532,6 +2981,56 @@ export class ExecutionEngine {
       hedgeOrderIds: [],
       hedged: false,
       resolvedOutcome: assessment.resolvedOutcome,
+      notes,
+      reconciledAt: portfolioReconciliation.reconciliation?.reconciledAt,
+      reconciliationSatisfied: portfolioReconciliation.reconciliation?.satisfied,
+      reconciledPortfolioValueUsd: portfolioReconciliation.reconciliation?.totalValueUsd,
+      reconciledPositionCount: portfolioReconciliation.reconciliation?.positions.length,
+    };
+  }
+
+  private async buildTemporalSuccessResult(
+    assessment: TemporalArbAssessment,
+    market: MarketDefinition,
+    reservationId: string,
+    reconciliation: SingleOrderReconciliation,
+    baseNotes: string[] = [],
+  ): Promise<ExecutionResult> {
+    const notes = [...baseNotes, ...reconciliation.notes];
+    if (reconciliation.fullyFlat) {
+      this.releaseExposure(
+        reservationId,
+        "Live temporal-arb reconciliation confirmed no residual exposure.",
+      );
+      notes.push("Live reconciliation confirmed no residual exposure; reservation released.");
+    } else {
+      this.retainReservation(
+        reservationId,
+        "Temporal-arb inventory remains open after a successful fill.",
+      );
+      notes.push("Reservation retained while the temporal inventory remains open.");
+    }
+
+    const portfolioReconciliation = await this.reconcilePortfolio(
+      market.conditionId,
+      "snapshot",
+    );
+    notes.push(...portfolioReconciliation.notes);
+
+    this.executionsSucceeded += 1;
+    return {
+      mode: "live",
+      success: true,
+      strategyType: "temporal_arb",
+      market,
+      timestamp: Date.now(),
+      tradeSize: assessment.tradeSize,
+      expectedProfitUsd: assessment.expectedProfitUsd,
+      estimatedSlippageUsd: assessment.estimatedSlippageUsd,
+      realizedSlippageUsd: reconciliation.realizedSlippageUsd,
+      orderIds: reconciliation.orderIds,
+      hedgeOrderIds: [],
+      hedged: false,
       notes,
       reconciledAt: portfolioReconciliation.reconciliation?.reconciledAt,
       reconciliationSatisfied: portfolioReconciliation.reconciliation?.satisfied,

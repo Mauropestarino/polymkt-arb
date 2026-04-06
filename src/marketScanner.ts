@@ -213,6 +213,16 @@ export class MarketScanner extends EventEmitter {
       slug: String(raw.market_slug ?? raw.slug ?? ""),
       question: String(raw.question ?? raw.title ?? ""),
       category: typeof raw.category === "string" ? raw.category : undefined,
+      endDate:
+        typeof raw.end_date_iso === "string"
+          ? raw.end_date_iso
+          : typeof raw.endDateIso === "string"
+            ? raw.endDateIso
+            : typeof raw.end_date === "string"
+              ? raw.end_date
+              : typeof raw.endDate === "string"
+                ? raw.endDate
+                : undefined,
       active,
       closed,
       liquidity: round(liquidity, 6),

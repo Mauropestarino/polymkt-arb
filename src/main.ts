@@ -6,6 +6,8 @@ import { AlertService } from "./alerts.js";
 import { ArbitrageEngine } from "./arbitrageEngine.js";
 import { BacktestRunner } from "./backtest.js";
 import { CeilingArbitrageEngine } from "./ceilingArbitrageEngine.js";
+import { CexPriceFeed } from "./cexPriceFeed.js";
+import { CryptoMarketRegistry } from "./cryptoMarketRegistry.js";
 import { CliDashboard } from "./dashboard.js";
 import { ExecutionEngine } from "./executionEngine.js";
 import { startHealthServer } from "./healthServer.js";
@@ -20,6 +22,8 @@ import { runGeoblockPreflight } from "./preflight.js";
 import { PortfolioReconciler } from "./portfolioReconciler.js";
 import { ResolutionSignalStore } from "./resolutionSignalStore.js";
 import { RiskManager } from "./riskManager.js";
+import { TemporalArbEngine } from "./temporalArbEngine.js";
+import { TemporalArbRiskManager } from "./temporalArbRiskManager.js";
 import { TradingGuard } from "./tradingGuard.js";
 import { TradingHeartbeatService } from "./tradingHeartbeat.js";
 import { WalletService } from "./wallet.js";
@@ -44,6 +48,15 @@ const main = async (): Promise<void> => {
   const portfolioReconciler = new PortfolioReconciler(config, dataApi, wallet, logger);
   const ctfSettlement = new CtfSettlementService(config, wallet, logger);
   const negRiskCatalog = new NegRiskCatalog(config, logger);
+  const cexPriceFeed = config.enableCexPriceFeed
+    ? new CexPriceFeed(config, logger)
+    : undefined;
+  const cryptoMarketRegistry = config.enableTemporalArbStrategy
+    ? new CryptoMarketRegistry(config, logger)
+    : undefined;
+  const temporalArbRiskManager = config.enableTemporalArbStrategy
+    ? new TemporalArbRiskManager(config, wallet, logger)
+    : undefined;
   const executionEngine = new ExecutionEngine(
     config,
     wallet,
@@ -54,6 +67,7 @@ const main = async (): Promise<void> => {
     {
       ctfSettlement,
       portfolioReconciler,
+      temporalArbRiskManager,
     },
   );
   const tradingHeartbeat = new TradingHeartbeatService(config, wallet, tradingGuard, logger);
@@ -99,6 +113,23 @@ const main = async (): Promise<void> => {
         logger,
       )
     : undefined;
+  const temporalArbEngine =
+    config.enableTemporalArbStrategy &&
+    cexPriceFeed &&
+    cryptoMarketRegistry &&
+    temporalArbRiskManager
+      ? new TemporalArbEngine(
+          config,
+          cryptoMarketRegistry,
+          cexPriceFeed,
+          store,
+          temporalArbRiskManager,
+          executionEngine,
+          alerts,
+          journal,
+          logger,
+        )
+      : undefined;
 
   const shutdown = async (
     scanner?: MarketScanner,
@@ -107,6 +138,7 @@ const main = async (): Promise<void> => {
   ) => {
     dashboard?.stop();
     tradingHeartbeat.stop();
+    cexPriceFeed?.stop();
     await scanner?.stop();
     signalStore.stop();
     if (healthServer) {
@@ -145,6 +177,8 @@ const main = async (): Promise<void> => {
       totalOpportunityDurationMs: 0,
       lastOpportunityAt: undefined,
     },
+    () => temporalArbEngine?.getStats(),
+    () => cexPriceFeed?.getStatus(),
     () => tradingGuard.getStatus(),
   );
   let healthServer: Server | undefined;
@@ -154,6 +188,7 @@ const main = async (): Promise<void> => {
     ceilingArbitrageEngine?.handleMarketUpdate(state);
     negRiskEngine?.handleMarketUpdate(state);
     lateResolutionEngine?.handleMarketUpdate(state);
+    temporalArbEngine?.handleMarketUpdate(state);
   });
 
   arbitrageEngine.on("opportunity", (record) => {
@@ -169,6 +204,10 @@ const main = async (): Promise<void> => {
   });
 
   lateResolutionEngine?.on("opportunity", (record) => {
+    dashboard.pushOpportunity(record);
+  });
+
+  temporalArbEngine?.on("opportunity", (record) => {
     dashboard.pushOpportunity(record);
   });
 
@@ -192,37 +231,53 @@ const main = async (): Promise<void> => {
     if (config.enableNegRiskStrategy) {
       await negRiskCatalog.refresh(trackedMarkets);
     }
+    cryptoMarketRegistry?.refresh(trackedMarkets);
+    if (config.enableTemporalArbStrategy && !config.enableCexPriceFeed) {
+      logger.warn("Temporal arb is enabled but ENABLE_CEX_PRICE_FEED=false, so the strategy will stay idle");
+    }
+    if (cexPriceFeed) {
+      cexPriceFeed.on("priceUpdate", (spot) => {
+        temporalArbEngine?.handleSpotPrice(spot);
+      });
+      await cexPriceFeed.start();
+    }
     await tradingHeartbeat.start();
     const getCombinedOpportunitiesDetected = () =>
       arbitrageEngine.getStats().opportunitiesSeen +
       (ceilingArbitrageEngine?.getStats().opportunitiesSeen ?? 0) +
       (negRiskEngine?.getStats().opportunitiesSeen ?? 0) +
-      (lateResolutionEngine?.getStats().opportunitiesSeen ?? 0);
+      (lateResolutionEngine?.getStats().opportunitiesSeen ?? 0) +
+      (temporalArbEngine?.getStats().opportunitiesSeen ?? 0);
     const getCombinedCapturedOpportunities = () =>
       arbitrageEngine.getStats().opportunitiesCaptured +
       (ceilingArbitrageEngine?.getStats().opportunitiesCaptured ?? 0) +
       (negRiskEngine?.getStats().opportunitiesCaptured ?? 0) +
-      (lateResolutionEngine?.getStats().opportunitiesCaptured ?? 0);
+      (lateResolutionEngine?.getStats().opportunitiesCaptured ?? 0) +
+      (temporalArbEngine?.getStats().opportunitiesCaptured ?? 0);
     const getCombinedViableOpportunities = () =>
       arbitrageEngine.getStats().opportunitiesViable +
       (ceilingArbitrageEngine?.getStats().opportunitiesViable ?? 0) +
       (negRiskEngine?.getStats().opportunitiesViable ?? 0) +
-      (lateResolutionEngine?.getStats().opportunitiesViable ?? 0);
+      (lateResolutionEngine?.getStats().opportunitiesViable ?? 0) +
+      (temporalArbEngine?.getStats().opportunitiesViable ?? 0);
     const getCombinedOpportunityDurationMs = () => {
       const binary = arbitrageEngine.getStats();
       const ceiling = ceilingArbitrageEngine?.getStats();
       const negRisk = negRiskEngine?.getStats();
       const late = lateResolutionEngine?.getStats();
+      const temporal = temporalArbEngine?.getStats();
       const totalDurationMs =
         binary.totalOpportunityDurationMs +
         (ceiling?.totalOpportunityDurationMs ?? 0) +
         (negRisk?.totalOpportunityDurationMs ?? 0) +
-        (late?.totalOpportunityDurationMs ?? 0);
+        (late?.totalOpportunityDurationMs ?? 0) +
+        (temporal?.totalOpportunityDurationMs ?? 0);
       const completedCount =
         binary.completedOpportunityCount +
         (ceiling?.completedOpportunityCount ?? 0) +
         (negRisk?.completedOpportunityCount ?? 0) +
-        (late?.completedOpportunityCount ?? 0);
+        (late?.completedOpportunityCount ?? 0) +
+        (temporal?.completedOpportunityCount ?? 0);
       return completedCount > 0 ? totalDurationMs / completedCount : 0;
     };
 
@@ -259,6 +314,11 @@ const main = async (): Promise<void> => {
           executionEngine.getStats().lastRetainedReservationReason,
         getLastRetainedReservationAt: () =>
           executionEngine.getStats().lastRetainedReservationAt,
+        getCexFeedConnected: () => cexPriceFeed?.getStatus().connected ?? false,
+        getCexFeedStaleTotal: () => cexPriceFeed?.getStats().staleCount ?? 0,
+        getTemporalArbSignalsTotal: () => temporalArbEngine?.getStats().signalsGenerated ?? 0,
+        getTemporalArbExecutionsTotal: () =>
+          temporalArbEngine?.getStats().opportunitiesExecuted ?? 0,
       },
       logger,
       () => dashboard.snapshot(),

@@ -41,6 +41,21 @@ const stringish = z.preprocess((value) => {
   return value;
 }, z.string().optional());
 
+const cexSymbolsSchema = z.preprocess((value) => {
+  if (Array.isArray(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return value
+      .split(",")
+      .map((entry) => entry.trim().toUpperCase())
+      .filter((entry) => entry.length > 0);
+  }
+
+  return value;
+}, z.array(z.enum(["BTC", "ETH", "SOL"])).min(1));
+
 const cliArgs = new Map<string, string>(
   process.argv
     .slice(2)
@@ -124,6 +139,20 @@ const schema = z
     enableBinaryCeilingStrategy: booleanish,
     enableNegRiskStrategy: booleanish,
     enableLateResolutionStrategy: booleanish,
+    enableTemporalArbStrategy: booleanish,
+    enableCexPriceFeed: booleanish,
+    cexPrimaryExchange: z.enum(["binance", "coinbase"]),
+    cexSymbols: cexSymbolsSchema,
+    cexFeedStaleThresholdMs: positiveInt(),
+    cexFeedReconnectBaseMs: positiveInt(),
+    cexFeedReconnectMaxMs: positiveInt(),
+    minTemporalArbConfidence: nonNegativeNumber(),
+    maxTemporalArbTradeSize: positiveNumber(),
+    temporalArbCooldownMs: nonNegativeInt(),
+    temporalArbMinTimeRemainingMs: positiveInt(),
+    temporalArbMaxLookaheadMs: positiveInt(),
+    temporalArbMaxSpotAgeMs: positiveInt(),
+    temporalArbEstimatedLatencyMs: nonNegativeInt(),
     lateResolutionSignalFile: z.string(),
     lateResolutionMaxSignalAgeMs: positiveInt(),
     useGcpSecretManager: booleanish,
@@ -259,6 +288,20 @@ const parsed = schema.parse({
   enableBinaryCeilingStrategy: envOrArg("ENABLE_BINARY_CEILING_STRATEGY", "true"),
   enableNegRiskStrategy: envOrArg("ENABLE_NEG_RISK_STRATEGY", "true"),
   enableLateResolutionStrategy: envOrArg("ENABLE_LATE_RESOLUTION_STRATEGY", "true"),
+  enableTemporalArbStrategy: envOrArg("ENABLE_TEMPORAL_ARB_STRATEGY", "false"),
+  enableCexPriceFeed: envOrArg("ENABLE_CEX_PRICE_FEED", "false"),
+  cexPrimaryExchange: envOrArg("CEX_PRIMARY_EXCHANGE", "binance")?.toLowerCase(),
+  cexSymbols: envOrArg("CEX_SYMBOLS", "BTC,ETH,SOL"),
+  cexFeedStaleThresholdMs: envOrArg("CEX_FEED_STALE_THRESHOLD_MS", "3000"),
+  cexFeedReconnectBaseMs: envOrArg("CEX_FEED_RECONNECT_BASE_MS", "1000"),
+  cexFeedReconnectMaxMs: envOrArg("CEX_FEED_RECONNECT_MAX_MS", "15000"),
+  minTemporalArbConfidence: envOrArg("MIN_TEMPORAL_ARB_CONFIDENCE", "0.82"),
+  maxTemporalArbTradeSize: envOrArg("MAX_TEMPORAL_ARB_TRADE_SIZE", "30"),
+  temporalArbCooldownMs: envOrArg("TEMPORAL_ARB_COOLDOWN_MS", "8000"),
+  temporalArbMinTimeRemainingMs: envOrArg("TEMPORAL_ARB_MIN_TIME_REMAINING_MS", "8000"),
+  temporalArbMaxLookaheadMs: envOrArg("TEMPORAL_ARB_MAX_LOOKAHEAD_MS", "600000"),
+  temporalArbMaxSpotAgeMs: envOrArg("TEMPORAL_ARB_MAX_SPOT_AGE_MS", "2000"),
+  temporalArbEstimatedLatencyMs: envOrArg("TEMPORAL_ARB_ESTIMATED_LATENCY_MS", "250"),
   lateResolutionSignalFile: envOrArg("LATE_RESOLUTION_SIGNAL_FILE", "./data/resolution-signals.ndjson"),
   lateResolutionMaxSignalAgeMs: envOrArg("LATE_RESOLUTION_MAX_SIGNAL_AGE_MS", "900000"),
   useGcpSecretManager: envOrArg("USE_GCP_SECRET_MANAGER", "false"),

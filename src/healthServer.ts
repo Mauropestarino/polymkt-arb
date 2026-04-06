@@ -33,6 +33,10 @@ const buildHealthPayload = (runtimeState: RuntimeState) => ({
   trading_resume_at: runtimeState.getTradingResumeAt(),
   last_retained_reservation_reason: runtimeState.getLastRetainedReservationReason(),
   last_retained_reservation_at: runtimeState.getLastRetainedReservationAt(),
+  cex_feed_connected: runtimeState.getCexFeedConnected(),
+  cex_feed_stale_total: runtimeState.getCexFeedStaleTotal(),
+  temporal_arb_signals_total: runtimeState.getTemporalArbSignalsTotal(),
+  temporal_arb_executions_total: runtimeState.getTemporalArbExecutionsTotal(),
 });
 
 const buildMetricsPayload = (runtimeState: RuntimeState): string =>
@@ -56,6 +60,10 @@ const buildMetricsPayload = (runtimeState: RuntimeState): string =>
     `trading_enabled ${runtimeState.getTradingEnabled() ? 1 : 0}`,
     `errors_total ${runtimeState.getErrorsTotal()}`,
     `last_retained_reservation_at ${runtimeState.getLastRetainedReservationAt() ?? 0}`,
+    `cex_feed_connected ${runtimeState.getCexFeedConnected() ? 1 : 0}`,
+    `cex_feed_stale_total ${runtimeState.getCexFeedStaleTotal()}`,
+    `temporal_arb_signals_total ${runtimeState.getTemporalArbSignalsTotal()}`,
+    `temporal_arb_executions_total ${runtimeState.getTemporalArbExecutionsTotal()}`,
   ].join("\n");
 
 const toTradingPauseReason = (
@@ -127,6 +135,29 @@ const buildFallbackSnapshot = (runtimeState: RuntimeState): DashboardSnapshot =>
       staleBooksSkipped: runtimeState.getStaleBooksSkipped(),
       lastBookAgeMs: runtimeState.getLastBookAgeMs(),
     },
+    temporalArb: {
+      opportunitiesSeen: runtimeState.getTemporalArbSignalsTotal(),
+      opportunitiesViable: runtimeState.getTemporalArbSignalsTotal(),
+      opportunitiesExecuted: runtimeState.getTemporalArbExecutionsTotal(),
+      opportunitiesCaptured: runtimeState.getTemporalArbExecutionsTotal(),
+      averageOpportunityDurationMs: undefined,
+      completedOpportunityCount: 0,
+      totalOpportunityDurationMs: 0,
+      lastOpportunityAt: undefined,
+      staleBooksSkipped: 0,
+      lastBookAgeMs: undefined,
+      signalsGenerated: runtimeState.getTemporalArbSignalsTotal(),
+      signalsRejectedByConfidence: 0,
+      signalsRejectedByFeed: 0,
+      staleFeedSkips: 0,
+      avgConfidenceOnExecution: 0,
+      avgEdgeOnExecution: 0,
+      bySymbol: {
+        BTC: { opportunitiesSeen: 0, opportunitiesExecuted: 0 },
+        ETH: { opportunitiesSeen: 0, opportunitiesExecuted: 0 },
+        SOL: { opportunitiesSeen: 0, opportunitiesExecuted: 0 },
+      },
+    },
     execution: {
       executionsAttempted,
       executionsSucceeded,
@@ -153,6 +184,17 @@ const buildFallbackSnapshot = (runtimeState: RuntimeState): DashboardSnapshot =>
           : 0,
       lastRetainedReservationReason: runtimeState.getLastRetainedReservationReason(),
       lastRetainedReservationAt: runtimeState.getLastRetainedReservationAt(),
+    },
+    cexFeedStatus: {
+      connected: runtimeState.getCexFeedConnected(),
+      live: runtimeState.getCexFeedConnected(),
+      primaryExchange: "binance",
+      activeExchangeBySymbol: {},
+      feedAgeMsBySymbol: {},
+      maxActiveFeedAgeMs: undefined,
+      staleSymbols: [],
+      disconnectCount: runtimeState.getWebsocketDisconnects(),
+      staleCount: runtimeState.getCexFeedStaleTotal(),
     },
     tradingGuard: {
       tradingEnabled: runtimeState.getTradingEnabled(),

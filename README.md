@@ -76,9 +76,51 @@ npm start
 - `ENABLE_ORDERBOOK_PERSISTENCE=true`: required if you want local snapshot replay backtests
 - `ENABLE_LATE_RESOLUTION_STRATEGY=true`: enables the second strategy using `LATE_RESOLUTION_SIGNAL_FILE`
 - `LATE_RESOLUTION_SIGNAL_FILE=./data/resolution-signals.ndjson`: local feed of winning-side signals
+- `ENABLE_TEMPORAL_ARB_STRATEGY=true`: enables the crypto candle lag strategy
+- `ENABLE_CEX_PRICE_FEED=true`: turns on the Binance/Coinbase spot feed required by `temporal_arb`
+- `TEMPORAL_ARB_ESTIMATED_LATENCY_MS=250`: local round-trip estimate used to discount confidence
 - `USE_GCP_SECRET_MANAGER=true`: load `PRIVATE_KEY` from Google Secret Manager instead of `.env`
 - `HEALTH_PORT=3001`: lightweight health/metrics HTTP endpoint
 - `examples/resolution-signals.example.ndjson`: sample payload for the late-resolution feed
+
+## Temporal Arbitrage Strategy
+
+`temporal_arb` watches real-time CEX spot prices for `BTC`, `ETH`, and `SOL`, then compares them with Polymarket crypto strike markets such as "Will BTC be above $95,000 at 12:15 UTC?". When spot has already moved meaningfully beyond the strike and Polymarket still prices the likely winner cheaply, the bot places a single-leg `FOK` buy on that side.
+
+Enable it with:
+
+```env
+ENABLE_TEMPORAL_ARB_STRATEGY=true
+ENABLE_CEX_PRICE_FEED=true
+CEX_PRIMARY_EXCHANGE=binance
+MIN_TEMPORAL_ARB_CONFIDENCE=0.82
+MAX_TEMPORAL_ARB_TRADE_SIZE=30
+TEMPORAL_ARB_MIN_TIME_REMAINING_MS=8000
+TEMPORAL_ARB_MAX_SPOT_AGE_MS=2000
+TEMPORAL_ARB_ESTIMATED_LATENCY_MS=250
+```
+
+The confidence model is intentionally simple and conservative. It starts from strike distance plus time-to-close, then discounts confidence for stale spot data, wide CEX spreads, wide Polymarket spreads, and unusually high latency. The engine will not trade below the hard safety floors: `0.70` confidence, `0.03%` normalized edge, `5s` remaining, or `5s` spot age.
+
+Recommended local setup:
+
+- keep `DRY_RUN=true` until you have measured latency
+- use `npm run latency:measure` and set `TEMPORAL_ARB_ESTIMATED_LATENCY_MS` to a conservative `p90` or `p99`
+- start with `MAX_TEMPORAL_ARB_TRADE_SIZE=10-30`
+- leave `TEMPORAL_ARB_MIN_TIME_REMAINING_MS=8000` unless your end-to-end latency is consistently lower
+
+Known limitations:
+
+- this edge is more fragile outside low-latency regions, especially far from US-East infrastructure
+- it depends on raw WebSocket feed quality from Binance/Coinbase and will skip signals if the spot feed goes stale
+- successful fills leave directional inventory open until resolution or manual unwind, so per-symbol exposure is capped conservatively
+
+Dashboard interpretation:
+
+- `Temporal arb: seen=... exec=...` shows opportunity windows seen and filled
+- `conf_avg` is the average confidence on successful executions
+- `btc / eth / sol` show executions by symbol
+- `feedAge` and `[LIVE|STALE]` summarize whether the selected CEX feed is currently fresh enough for temporal signals
 
 ## Backtesting
 

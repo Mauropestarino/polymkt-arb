@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "backtest": "tsx src/main.ts --mode=backtest",
     "report": "npm run build && node dist/report.js",
+    "latency:measure": "node scripts/measure-latency.mjs",
     "test": "vitest run",
     "security:check": "node scripts/security-check.mjs",
     "pm2:start": "npm run build && node scripts/pm2-runner.mjs start ecosystem.config.cjs",

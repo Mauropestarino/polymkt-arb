@@ -3,12 +3,16 @@ export interface OrderBookLevel {
   size: number;
 }
 
+export type CryptoSymbol = "BTC" | "ETH" | "SOL";
+export type CexExchange = "binance" | "coinbase";
+
 export type ArbitrageDirection = "YES_high" | "NO_high";
 export type StrategyType =
   | "binary_arb"
   | "binary_ceiling"
   | "neg_risk_arb"
-  | "late_resolution";
+  | "late_resolution"
+  | "temporal_arb";
 export type ResolutionOutcome = "YES" | "NO";
 
 export interface GammaMarket {
@@ -42,6 +46,7 @@ export interface MarketDefinition {
   slug: string;
   question: string;
   category?: string;
+  endDate?: string;
   active: boolean;
   closed: boolean;
   liquidity: number;
@@ -284,6 +289,60 @@ export interface PortfolioReconciliationResult {
   notes: string[];
 }
 
+export interface SpotPrice {
+  symbol: CryptoSymbol;
+  price: number;
+  bidPrice: number;
+  askPrice: number;
+  receivedAt: number;
+  exchange: CexExchange;
+  serverTimestampMs?: number;
+  latencyEstimateMs?: number;
+}
+
+export interface CexFeedStats {
+  connected: boolean;
+  primaryExchange: CexExchange;
+  trackedSymbols: CryptoSymbol[];
+  disconnectCount: number;
+  staleCount: number;
+  lastBothFeedsDownAt?: number;
+  exchanges: Record<
+    CexExchange,
+    {
+      connected: boolean;
+      disconnects: number;
+      reconnectAttempts: number;
+      lastMessageAt?: number;
+    }
+  >;
+  symbols: Partial<
+    Record<
+      CryptoSymbol,
+      {
+        stale: boolean;
+        lastUpdateAt?: number;
+        activeExchange?: CexExchange;
+        lastSwitchAt?: number;
+        lastLatencyEstimateMs?: number;
+        staleCount: number;
+      }
+    >
+  >;
+}
+
+export interface CexPriceFeedStatus {
+  connected: boolean;
+  live: boolean;
+  primaryExchange: CexExchange;
+  activeExchangeBySymbol: Partial<Record<CryptoSymbol, CexExchange>>;
+  feedAgeMsBySymbol: Partial<Record<CryptoSymbol, number>>;
+  maxActiveFeedAgeMs?: number;
+  staleSymbols: CryptoSymbol[];
+  disconnectCount: number;
+  staleCount: number;
+}
+
 export interface ExecutionResult {
   mode: "live" | "paper" | "backtest";
   success: boolean;
@@ -339,6 +398,13 @@ export interface OpportunityLogRecord {
   expectedProfitUsd: number;
   expectedProfitPct: number;
   viable: boolean;
+  symbol?: CryptoSymbol;
+  spotPrice?: number;
+  strikePrice?: number;
+  normalizedEdge?: number;
+  timeRemainingMs?: number;
+  resolutionConfidence?: number;
+  spotAgeMs?: number;
   detectedAt?: number;
   expiredAt?: number;
   opportunity_duration_ms?: number;
@@ -373,6 +439,13 @@ export interface TradeLogRecord {
   orderIds: string[];
   hedgeOrderIds: string[];
   notes: string[];
+  symbol?: CryptoSymbol;
+  spotPrice?: number;
+  strikePrice?: number;
+  normalizedEdge?: number;
+  timeRemainingMs?: number;
+  resolutionConfidence?: number;
+  spotAgeMs?: number;
   settlementAction?: SettlementReceipt["action"];
   settlementTxHash?: string;
   settlementAmount?: number;
@@ -427,6 +500,22 @@ export interface LateResolutionStats {
   completedOpportunityCount: number;
   totalOpportunityDurationMs: number;
   lastOpportunityAt?: number;
+}
+
+export interface TemporalArbStats extends ArbitrageEngineStats {
+  signalsGenerated: number;
+  signalsRejectedByConfidence: number;
+  signalsRejectedByFeed: number;
+  staleFeedSkips: number;
+  avgConfidenceOnExecution: number;
+  avgEdgeOnExecution: number;
+  bySymbol: Record<
+    CryptoSymbol,
+    {
+      opportunitiesSeen: number;
+      opportunitiesExecuted: number;
+    }
+  >;
 }
 
 export interface ExecutionStats {
@@ -491,6 +580,10 @@ export interface RuntimeState {
   getTradingResumeAt(): number | undefined;
   getLastRetainedReservationReason(): string | undefined;
   getLastRetainedReservationAt(): number | undefined;
+  getCexFeedConnected(): boolean;
+  getCexFeedStaleTotal(): number;
+  getTemporalArbSignalsTotal(): number;
+  getTemporalArbExecutionsTotal(): number;
 }
 
 export interface NetProfitModelInput {
@@ -518,7 +611,9 @@ export interface DashboardSnapshot {
   ceilingArbitrage?: ArbitrageEngineStats;
   negRiskArbitrage?: ArbitrageEngineStats;
   lateResolution?: LateResolutionStats;
+  temporalArb?: TemporalArbStats;
   execution: ExecutionStats;
+  cexFeedStatus?: CexPriceFeedStatus;
   tradingGuard?: TradingGuardStatus;
   recentOpportunities: OpportunityLogRecord[];
 }
@@ -713,4 +808,57 @@ export interface LateResolutionAssessment {
   expectedProfitUsd: number;
   expectedProfitPct: number;
   source: string;
+}
+
+export interface CryptoStrikeMarket {
+  conditionId: string;
+  slug: string;
+  question: string;
+  symbol: CryptoSymbol;
+  strikePrice: number;
+  windowEndMs: number;
+  windowDurationMinutes: 5 | 15 | 60 | 240;
+  yesTokenId: string;
+  noTokenId: string;
+  negRisk?: boolean;
+  tickSizeHint?: number;
+}
+
+export interface TemporalArbSignal {
+  market: CryptoStrikeMarket;
+  symbol: CryptoSymbol;
+  spotPrice: number;
+  strikePrice: number;
+  direction: "YES" | "NO";
+  normalizedEdge: number;
+  timeRemainingMs: number;
+  resolutionConfidence: number;
+  spotSource: CexExchange;
+  spotReceivedAt: number;
+  polymarketPrice: number;
+  impliedEdgeUsd: number;
+  timestamp: number;
+}
+
+export interface TemporalArbAssessment {
+  viable: boolean;
+  reason?: string;
+  strategyType: "temporal_arb";
+  market: CryptoStrikeMarket;
+  signal: TemporalArbSignal;
+  tradeSize: number;
+  leg: FillEstimate & {
+    tokenId: string;
+    bestAsk: number;
+    fee: FeeEstimate;
+  };
+  resolutionConfidence: number;
+  expectedPayout: number;
+  expectedProfitUsd: number;
+  expectedProfitPct: number;
+  estimatedSlippageUsd: number;
+  totalFeesUsd: number;
+  gasUsd: number;
+  totalSpendUsd: number;
+  timestamp: number;
 }

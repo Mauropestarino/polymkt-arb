@@ -6,6 +6,7 @@ import type {
   LateResolutionAssessment,
   NegRiskAssessment,
   RiskAssessment,
+  TemporalArbAssessment,
 } from "./types.js";
 
 export class AlertService {
@@ -15,7 +16,12 @@ export class AlertService {
   ) {}
 
   async notifyOpportunity(
-    assessment: RiskAssessment | CeilingAssessment | LateResolutionAssessment | NegRiskAssessment,
+    assessment:
+      | RiskAssessment
+      | CeilingAssessment
+      | LateResolutionAssessment
+      | NegRiskAssessment
+      | TemporalArbAssessment,
   ): Promise<void> {
     if (!assessment.viable) {
       return;
@@ -39,6 +45,16 @@ export class AlertService {
             `Size: ${assessment.tradeSize.toFixed(4)}`,
             `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
           ].join("\n")
+        : this.isTemporalArbAssessment(assessment)
+          ? [
+              "Polymarket temporal-arb opportunity",
+              assessment.market.question,
+              `Direction: ${assessment.signal.direction}`,
+              `Spot / strike: ${assessment.signal.spotPrice.toFixed(2)} / ${assessment.signal.strikePrice.toFixed(2)}`,
+              `Confidence: ${assessment.resolutionConfidence.toFixed(3)}`,
+              `Size: ${assessment.tradeSize.toFixed(4)}`,
+              `Expected profit: $${assessment.expectedProfitUsd.toFixed(4)} (${(assessment.expectedProfitPct * 100).toFixed(2)}%)`,
+            ].join("\n")
       : [
           "Polymarket arb opportunity",
           assessment.market.question,
@@ -118,14 +134,35 @@ export class AlertService {
   }
 
   private isLateResolutionAssessment(
-    assessment: RiskAssessment | CeilingAssessment | LateResolutionAssessment | NegRiskAssessment,
+    assessment:
+      | RiskAssessment
+      | CeilingAssessment
+      | LateResolutionAssessment
+      | NegRiskAssessment
+      | TemporalArbAssessment,
   ): assessment is LateResolutionAssessment {
     return "strategyType" in assessment && assessment.strategyType === "late_resolution";
   }
 
   private isNegRiskAssessment(
-    assessment: RiskAssessment | CeilingAssessment | LateResolutionAssessment | NegRiskAssessment,
+    assessment:
+      | RiskAssessment
+      | CeilingAssessment
+      | LateResolutionAssessment
+      | NegRiskAssessment
+      | TemporalArbAssessment,
   ): assessment is NegRiskAssessment {
     return "strategyType" in assessment && assessment.strategyType === "neg_risk_arb";
+  }
+
+  private isTemporalArbAssessment(
+    assessment:
+      | RiskAssessment
+      | CeilingAssessment
+      | LateResolutionAssessment
+      | NegRiskAssessment
+      | TemporalArbAssessment,
+  ): assessment is TemporalArbAssessment {
+    return "strategyType" in assessment && assessment.strategyType === "temporal_arb";
   }
 }

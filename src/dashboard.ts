@@ -1,10 +1,12 @@
 import type {
   ArbitrageEngineStats,
+  CexPriceFeedStatus,
   DashboardSnapshot,
   ExecutionStats,
   LateResolutionStats,
   MarketScannerStats,
   OpportunityLogRecord,
+  TemporalArbStats,
   TradingGuardStatus,
 } from "./types.js";
 import { formatMs, formatPct, formatUsd } from "./lib/utils.js";
@@ -21,6 +23,8 @@ export class CliDashboard {
     private readonly getNegRiskArbitrageStats: (() => ArbitrageEngineStats | undefined) | undefined,
     private readonly getExecutionStats: () => ExecutionStats,
     private readonly getLateResolutionStats?: () => LateResolutionStats,
+    private readonly getTemporalArbStats?: () => TemporalArbStats | undefined,
+    private readonly getCexFeedStatus?: () => CexPriceFeedStatus | undefined,
     private readonly getTradingGuardStatus?: () => TradingGuardStatus,
   ) {}
 
@@ -52,7 +56,9 @@ export class CliDashboard {
       ceilingArbitrage: this.getCeilingArbitrageStats?.(),
       negRiskArbitrage: this.getNegRiskArbitrageStats?.(),
       lateResolution: this.getLateResolutionStats?.(),
+      temporalArb: this.getTemporalArbStats?.(),
       execution: this.getExecutionStats(),
+      cexFeedStatus: this.getCexFeedStatus?.(),
       tradingGuard: this.getTradingGuardStatus?.(),
       recentOpportunities: [...this.recentOpportunities],
     };
@@ -65,12 +71,14 @@ export class CliDashboard {
       snapshot.arbitrage.opportunitiesSeen +
       (snapshot.ceilingArbitrage?.opportunitiesSeen ?? 0) +
       (snapshot.negRiskArbitrage?.opportunitiesSeen ?? 0) +
-      (snapshot.lateResolution?.opportunitiesSeen ?? 0);
+      (snapshot.lateResolution?.opportunitiesSeen ?? 0) +
+      (snapshot.temporalArb?.opportunitiesSeen ?? 0);
     const totalCapturedOpportunities =
       snapshot.arbitrage.opportunitiesCaptured +
       (snapshot.ceilingArbitrage?.opportunitiesCaptured ?? 0) +
       (snapshot.negRiskArbitrage?.opportunitiesCaptured ?? 0) +
-      (snapshot.lateResolution?.opportunitiesCaptured ?? 0);
+      (snapshot.lateResolution?.opportunitiesCaptured ?? 0) +
+      (snapshot.temporalArb?.opportunitiesCaptured ?? 0);
     const captureRate =
       totalOpportunitiesSeen > 0
         ? totalCapturedOpportunities / totalOpportunitiesSeen
@@ -103,6 +111,11 @@ export class CliDashboard {
     );
     console.log(
       `Late resolution: seen=${snapshot.lateResolution?.opportunitiesSeen ?? 0} captured=${snapshot.lateResolution?.opportunitiesCaptured ?? 0} viable=${snapshot.lateResolution?.opportunitiesViable ?? 0} executed=${snapshot.lateResolution?.opportunitiesExecuted ?? 0} avgDur=${formatMs(snapshot.lateResolution?.averageOpportunityDurationMs)}`,
+    );
+    console.log(
+      `Temporal arb: seen=${snapshot.temporalArb?.opportunitiesSeen ?? 0} exec=${snapshot.temporalArb?.opportunitiesExecuted ?? 0} conf_avg=${(snapshot.temporalArb?.avgConfidenceOnExecution ?? 0).toFixed(2)} btc=${snapshot.temporalArb?.bySymbol.BTC.opportunitiesExecuted ?? 0} eth=${snapshot.temporalArb?.bySymbol.ETH.opportunitiesExecuted ?? 0} sol=${snapshot.temporalArb?.bySymbol.SOL.opportunitiesExecuted ?? 0} feedAge=${formatMs(snapshot.cexFeedStatus?.maxActiveFeedAgeMs)} [${
+        snapshot.cexFeedStatus?.live ? "LIVE" : "STALE"
+      }]`,
     );
     console.log(
       `Executions: attempted=${snapshot.execution.executionsAttempted} success=${snapshot.execution.executionsSucceeded} failed=${snapshot.execution.executionsFailed} hedges=${snapshot.execution.hedgesTriggered} fillRate=${formatPct(snapshot.execution.fillRate)} shadowFill=${formatPct(snapshot.execution.shadowFillRate)} shareFill=${formatPct(snapshot.execution.shareFillRate)} openNotional=${formatUsd(snapshot.execution.openNotionalUsd)} reservations=${snapshot.execution.openReservationsCount}`,
